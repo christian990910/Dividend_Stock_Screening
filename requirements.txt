@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pydantic
+apscheduler
+akshare
+pandas
+numpy
