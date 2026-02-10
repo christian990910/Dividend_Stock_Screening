@@ -1,349 +1,331 @@
-"""
-股票分析系统 - FastAPI 主应用
-功能：添加股票、定时分析、输出CSV、手动分析
-"""
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+import os
+import time
+import datetime
+import asyncio
+import re
+import pandas as pd
+import numpy as np
+import akshare as ak
 from typing import List, Optional
-from datetime import datetime, time
-import uvicorn
+
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, desc, func
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-import logging
 
-from database import (
-    init_db, add_stock_to_list, get_all_stocks, 
-    remove_stock_from_list, save_analysis_result,
-    get_latest_analysis, save_historical_data
-)
-from analysis import analyze_stock, fetch_stock_data
-from utils import export_to_csv
-import config
+# --- 1. 数据库配置 ---
+SQLALCHEMY_DATABASE_URL = "sqlite:///./stock_pro_system.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-# 配置日志
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# --- 2. 数据库模型 ---
+class StockTrack(Base):
+    """自选股监控名单"""
+    __tablename__ = "stock_track"
+    code = Column(String, primary_key=True)
+    name = Column(String)
 
-app = FastAPI(title="股票分析系统", description="基于FastAPI的股票筛选分析系统")
+class StockHolding(Base):
+    """实盘持仓表"""
+    __tablename__ = "stock_holdings"
+    code = Column(String, primary_key=True)
+    quantity = Column(Integer, default=0)
+    avg_price = Column(Float, default=0.0)
 
-# 初始化数据库
-init_db()
+class StockHistory(Base):
+    """股票基础数据缓存表 (用于本地分析)"""
+    __tablename__ = "stock_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String, index=True)
+    date = Column(DateTime, index=True)
+    close = Column(Float)
+    pe = Column(Float)
+    pb = Column(Float)
+    dividend_yield = Column(Float)
 
-# 创建调度器
+class DailyAnalysis(Base):
+    """每日深度分析结果结果表"""
+    __tablename__ = "daily_analysis"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String, index=True)
+    date = Column(DateTime, default=datetime.datetime.now)
+    price = Column(Float)
+    volatility = Column(Float)  # 年化波动率
+    pe_percentile = Column(Float) # PE在历史中的百分位
+    pb_percentile = Column(Float) # PB在历史中的百分位
+    dividend_yield = Column(Float)
+    score = Column(Integer)
+    suggestion = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+# --- 3. 核心工具类 ---
+class StockManager:
+    @staticmethod
+    def get_last_trading_date():
+        now = datetime.datetime.now()
+        target = now if now.hour >= 16 else now - datetime.timedelta(days=1)
+        while target.weekday() >= 5:
+            target -= datetime.timedelta(days=1)
+        return target.date()
+
+    @staticmethod
+    def calculate_indicators(df: pd.DataFrame):
+        """基于历史数据 DataFrame 计算关键指标"""
+        if df.empty or len(df) < 10:
+            return None
+        
+        # --- 核心修复：统一列名映射 ---
+        # 兼容乐咕(dv_ratio)和东财(dividend_yield)的差异
+        rename_map = {'dv_ratio': 'dividend_yield', 'trade_date': 'date'}
+        df = df.rename(columns=rename_map)
+        
+        latest = df.iloc[-1]
+        
+        # 再次检查关键列是否存在
+        required_cols = ['close', 'pe', 'pb', 'dividend_yield']
+        for col in required_cols:
+            if col not in df.columns:
+                # 如果缺少列，补零防止崩溃
+                df[col] = 0.0
+        
+        latest = df.iloc[-1]
+
+        # 1. 计算波动率 (120日)
+        hist_120 = df.tail(120).copy()
+        log_ret = np.log(hist_120['close'] / hist_120['close'].shift(1))
+        volatility = log_ret.std() * np.sqrt(252) * 100
+        
+        # 2. 计算 PE/PB 百分位
+        pe_pct = (df['pe'] < latest['pe']).mean() * 100 if latest['pe'] > 0 else 0
+        pb_pct = (df['pb'] < latest['pb']).mean() * 100 if latest['pb'] > 0 else 0
+        
+        # 3. 评分逻辑
+        score = 0
+        if latest['dividend_yield'] > 3.5: score += 30
+        if 0 < pe_pct < 20: score += 20
+        if 0 < pb_pct < 20: score += 20
+        if 0 < volatility < 25: score += 30
+        
+        return {
+            "price": float(latest['close']),
+            "volatility": round(float(volatility), 2) if not np.isnan(volatility) else 0,
+            "pe_pct": round(float(pe_pct), 2),
+            "pb_pct": round(float(pb_pct), 2),
+            "dividend": round(float(latest['dividend_yield']), 2),
+            "score": int(score)
+        }
+
+# --- 4. 业务逻辑服务 (统一函数名版) ---
+class AnalysisService:
+    def __init__(self):
+        self.mgr = StockManager()
+
+    async def update_stock_data(self, db, code: str):
+        """联网抓取历史数据 (乐咕优先，东财保底)"""
+        print(f"正在联网更新 {code} 的历史数据...")
+        df = None
+        try:
+            # 方案 A & B: 尝试乐咕接口
+            for func_name in ["stock_a_indicator_lg", "stock_a_lg_indicator"]:
+                if hasattr(ak, func_name):
+                    try:
+                        df = getattr(ak, func_name)(symbol=code)
+                        if df is not None and not df.empty:
+                            # 统一乐咕的列名到项目标准
+                            df = df.rename(columns={'dv_ratio': 'dividend_yield'})
+                            break
+                    except:
+                        continue
+            
+            # 方案 C: 东财保底
+            if df is None or df.empty:
+                print(f"警告: 乐咕接口失效，正在尝试东财历史接口保底...")
+                df_em = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
+                if not df_em.empty:
+                    df = pd.DataFrame()
+                    df['trade_date'] = df_em['日期']
+                    df['close'] = df_em['收盘']
+                    df['pe'] = 0.0
+                    df['pb'] = 0.0
+                    df['dividend_yield'] = 0.0 # 修改这里：统一为 dividend_yield
+            
+            if df is None or df.empty:
+                print(f"错误: 无法获取 {code} 的任何历史数据")
+                return None
+            
+            # 存入数据库
+            db.query(StockHistory).filter(StockHistory.code == code).delete()
+            objs = []
+            for _, row in df.iterrows():
+                objs.append(StockHistory(
+                    code=code,
+                    date=pd.to_datetime(row['trade_date']),
+                    close=float(row['close']),
+                    pe=float(row.get('pe', 0)),
+                    pb=float(row.get('pb', 0)),
+                    dividend_yield=float(row.get('dividend_yield', 0)) # 修改这里
+                ))
+            db.bulk_save_objects(objs)
+            db.commit()
+            print(f"[{code}] 数据更新成功: 抓取到 {len(objs)} 条记录")
+            return df
+
+        except Exception as e:
+            print(f"更新异常 {code}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    async def run_single_analysis(self, code: str):
+        """单只股票分析"""
+        db = SessionLocal()
+        try:
+            last_trade_date = self.mgr.get_last_trading_date()
+            latest_record = db.query(StockHistory).filter(StockHistory.code == code).order_by(StockHistory.date.desc()).first()
+            
+            if not latest_record or latest_record.date.date() < last_trade_date:
+                await asyncio.sleep(30)
+                df_hist = await self.update_stock_data(db, code)
+            else:
+                print(f"本地数据已是最新: {code}")
+                rows = db.query(StockHistory).filter(StockHistory.code == code).order_by(StockHistory.date.asc()).all()
+                # 转换回 DataFrame 时确保列名一致
+                df_hist = pd.DataFrame([{
+                    'close': r.close, 
+                    'pe': r.pe, 
+                    'pb': r.pb, 
+                    'dividend_yield': r.dividend_yield
+                } for r in rows])
+
+            if df_hist is None or df_hist.empty:
+                return
+
+            res = self.mgr.calculate_indicators(df_hist)
+            if not res: return
+
+            # 存储 DailyAnalysis 结果
+            holding = db.query(StockHolding).filter(StockHolding.code == code).first()
+            sug = "观望"
+            if res['score'] >= 75:
+                sug = "加仓" if holding and res['price'] < holding.avg_price else "建议建仓"
+
+            analysis = DailyAnalysis(
+                code=code,
+                price=res['price'],
+                volatility=res['volatility'],
+                pe_percentile=res['pe_pct'],
+                pb_percentile=res['pb_pct'],
+                dividend_yield=res['dividend'],
+                score=res['score'],
+                suggestion=sug
+            )
+            db.add(analysis)
+            db.commit()
+            print(f"[{code}] 分析决策完成: {sug}")
+        except Exception as e:
+            print(f"分析流程出错 {code}: {e}")
+        finally:
+            db.close()
+
+# --- 外部调用函数 ---
+async def start_full_analysis():
+    """遍历自选列表启动分析"""
+    db = SessionLocal()
+    stocks = db.query(StockTrack).all()
+    db.close()
+    
+    total = len(stocks)
+    print(f"开始批量分析任务，共 {total} 只股票...")
+    
+    for s in stocks:
+        await service.run_single_analysis(s.code)
+    
+    print("所有分析任务已完成。")
+# --- 5. FastAPI 接口设计 ---
+app = FastAPI(title="智能策略系统 v3.0")
+service = AnalysisService()
+
+@app.post("/stocks/bulk")
+def bulk_add_stocks(codes: str):
+    """批量添加股票代码 (逗号或空格分隔)"""
+    db = SessionLocal()
+    code_list = list(set(re.findall(r'\d{6}', codes)))
+    all_info = ak.stock_info_a_code_name()
+    name_map = dict(zip(all_info['code'], all_info['name']))
+    
+    for c in code_list:
+        if c in name_map:
+            db.merge(StockTrack(code=c, name=name_map[c]))
+    db.commit()
+    db.close()
+    return {"msg": f"监控列表已更新，当前共 {len(code_list)} 只股票"}
+
+@app.post("/holdings/")
+def set_holding(code: str, qty: int, price: float):
+    """录入实盘持仓记录"""
+    db = SessionLocal()
+    db.merge(StockHolding(code=code, quantity=qty, avg_price=price))
+    db.commit()
+    db.close()
+    return {"msg": "持仓信息已保存"}
+
+async def start_full_analysis():
+    db = SessionLocal()
+    stocks = db.query(StockTrack).all()
+    db.close()
+    print(f"开始批量分析任务，预计耗时 {len(stocks)*30/60:.1f} 分钟...")
+    for s in stocks:
+        await service.run_single_analysis(s.code)
+
+@app.post("/analyze/manual")
+def manual_analysis(background_tasks: BackgroundTasks):
+    background_tasks.add_task(start_full_analysis)
+    return {"msg": "后台分析已启动，系统会自动对比本地数据，如需联网更新会自动限速。"}
+
+@app.get("/export/csv")
+def export_csv():
+    """导出最新的分析报告"""
+    db = SessionLocal()
+    # 每个代码取最新的一条分析记录
+    subquery = db.query(DailyAnalysis.code, func.max(DailyAnalysis.date).label('max_date')).group_by(DailyAnalysis.code).subquery()
+    results = db.query(DailyAnalysis).join(subquery, (DailyAnalysis.code == subquery.c.code) & (DailyAnalysis.date == subquery.c.max_date)).all()
+    
+    data = []
+    for r in results:
+        track = db.query(StockTrack).filter(StockTrack.code == r.code).first()
+        hold = db.query(StockHolding).filter(StockHolding.code == r.code).first()
+        data.append({
+            "日期": r.date.strftime("%Y-%m-%d"),
+            "代码": r.code,
+            "名称": track.name if track else "未知",
+            "价格": r.price,
+            "持仓成本": hold.avg_price if hold else "--",
+            "股息%": r.dividend_yield,
+            "PE百分位%": r.pe_percentile,
+            "波动率%": r.volatility,
+            "综合得分": r.score,
+            "策略建议": r.suggestion
+        })
+    db.close()
+    
+    if not data: return {"msg": "无分析数据"}
+    df = pd.DataFrame(data)
+    filename = f"Analysis_Report_{datetime.datetime.now().strftime('%Y%m%d')}.csv"
+    df.to_csv(filename, index=False, encoding="utf_8_sig")
+    return FileResponse(filename, filename=filename)
+
+# --- 6. 定时任务配置 ---
 scheduler = BackgroundScheduler()
-
-
-class StockRequest(BaseModel):
-    """添加股票请求模型"""
-    code: str
-    name: Optional[str] = None
-
-
-class AnalysisResponse(BaseModel):
-    """分析结果响应模型"""
-    code: str
-    name: str
-    date: str
-    volatility: float
-    dividend_yield: float
-    pb_percentile: float
-    pe_percentile: float
-    buy_signal: bool
-    reason: str
-
-
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时的事件"""
-    logger.info("应用启动，初始化定时任务...")
-    
-    # 每日定时分析（每天早上9点执行）
-    scheduler.add_job(
-        daily_analysis_job,
-        trigger=CronTrigger(hour=config.DAILY_ANALYSIS_HOUR, minute=config.DAILY_ANALYSIS_MINUTE),
-        id='daily_analysis',
-        name='每日股票分析任务',
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=300  # 错过5分钟内仍执行
-    )
-    
-    # 每60秒获取一次数据（避免频繁请求）
-    scheduler.add_job(
-        fetch_data_job,
-        trigger='interval',
-        seconds=config.DATA_FETCH_INTERVAL,
-        id='fetch_data',
-        name='定时获取股票数据',
-        replace_existing=True,
-        max_instances=1,  # 最多只运行1个实例
-        misfire_grace_time=15  # 错过触发时间15秒内仍执行
-    )
-    
-    scheduler.start()
-    logger.info("定时任务已启动")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭时的事件"""
-    logger.info("关闭定时任务...")
-    scheduler.shutdown()
-
-
-def daily_analysis_job():
-    """每日分析任务"""
-    logger.info("开始执行每日分析任务...")
-    try:
-        stocks = get_all_stocks()
-        if not stocks:
-            logger.warning("分析列表为空，跳过分析")
-            return
-        
-        results = []
-        for stock in stocks:
-            try:
-                logger.info(f"分析股票: {stock['code']} - {stock['name']}")
-                result = analyze_stock(stock['code'], stock['name'])
-                if result:
-                    save_analysis_result(result)
-                    results.append(result)
-            except Exception as e:
-                logger.error(f"分析股票 {stock['code']} 失败: {str(e)}")
-        
-        # 导出到CSV
-        if results:
-            filename = export_to_csv(results)
-            logger.info(f"分析完成，结果已导出到: {filename}")
-        else:
-            logger.warning("没有成功分析的股票")
-            
-    except Exception as e:
-        logger.error(f"每日分析任务执行失败: {str(e)}")
-
-
-def fetch_data_job():
-    """定时获取股票数据任务"""
-    try:
-        stocks = get_all_stocks()
-        if not stocks:
-            logger.debug("股票列表为空，跳过数据获取")
-            return
-        
-        logger.info(f"开始获取 {len(stocks)} 只股票的数据...")
-        success_count = 0
-        skip_count = 0
-        error_count = 0
-        
-        for stock in stocks:
-            try:
-                # 获取并保存历史数据
-                data = fetch_stock_data(stock['code'])
-                if data is not None and not data.empty:
-                    save_historical_data(stock['code'], data)
-                    success_count += 1
-                    logger.debug(f"✓ 成功获取: {stock['code']} - {stock['name']}")
-                elif data is None:
-                    skip_count += 1
-                    logger.debug(f"⊘ 跳过（限流）: {stock['code']} - {stock['name']}")
-            except Exception as e:
-                error_count += 1
-                logger.error(f"✗ 获取股票 {stock['code']} 数据失败: {str(e)}")
-        
-        logger.info(f"数据获取完成 - 成功: {success_count}, 跳过: {skip_count}, 失败: {error_count}")
-            
-    except Exception as e:
-        logger.error(f"定时获取数据任务失败: {str(e)}")
-
-
-@app.get("/")
-async def root():
-    """根路径"""
-    return {
-        "message": "股票分析系统API",
-        "version": "1.0.0",
-        "endpoints": {
-            "添加股票": "POST /stocks",
-            "获取股票列表": "GET /stocks",
-            "删除股票": "DELETE /stocks/{code}",
-            "手动分析": "POST /analyze",
-            "获取最新分析": "GET /analysis/latest",
-            "下载CSV": "GET /export/csv"
-        }
-    }
-
-
-@app.post("/stocks", summary="添加股票到分析列表")
-async def add_stock(stock: StockRequest):
-    """
-    添加股票编码到分析列表
-    - code: 股票代码（如：600519）
-    - name: 股票名称（可选）
-    """
-    try:
-        # 如果没有提供名称，尝试从akshare获取
-        name = stock.name
-        if not name:
-            try:
-                data = fetch_stock_data(stock.code)
-                if data is not None and not data.empty:
-                    name = f"股票_{stock.code}"
-                else:
-                    name = f"股票_{stock.code}"
-            except:
-                name = f"股票_{stock.code}"
-        
-        result = add_stock_to_list(stock.code, name)
-        if result:
-            logger.info(f"成功添加股票: {stock.code} - {name}")
-            return {"message": "添加成功", "code": stock.code, "name": name}
-        else:
-            raise HTTPException(status_code=400, detail="股票已存在")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"添加股票失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"添加失败: {str(e)}")
-
-
-@app.get("/stocks", summary="获取所有股票列表")
-async def list_stocks():
-    """获取分析列表中的所有股票"""
-    try:
-        stocks = get_all_stocks()
-        return {
-            "total": len(stocks),
-            "stocks": stocks
-        }
-    except Exception as e:
-        logger.error(f"获取股票列表失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"获取失败: {str(e)}")
-
-
-@app.delete("/stocks/{code}", summary="删除股票")
-async def delete_stock(code: str):
-    """从分析列表中删除股票"""
-    try:
-        result = remove_stock_from_list(code)
-        if result:
-            logger.info(f"成功删除股票: {code}")
-            return {"message": "删除成功", "code": code}
-        else:
-            raise HTTPException(status_code=404, detail="股票不存在")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"删除股票失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
-
-
-@app.post("/analyze", summary="手动执行分析")
-async def manual_analysis(background_tasks: BackgroundTasks):
-    """
-    手动触发分析所有股票
-    分析结果会保存到数据库并导出CSV
-    """
-    try:
-        stocks = get_all_stocks()
-        if not stocks:
-            raise HTTPException(status_code=400, detail="分析列表为空")
-        
-        # 在后台执行分析任务
-        background_tasks.add_task(run_analysis_task)
-        
-        return {
-            "message": "分析任务已启动",
-            "total_stocks": len(stocks),
-            "status": "processing"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"启动分析任务失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"启动失败: {str(e)}")
-
-
-def run_analysis_task():
-    """执行分析任务（后台任务）"""
-    logger.info("开始手动分析任务...")
-    try:
-        stocks = get_all_stocks()
-        results = []
-        
-        for stock in stocks:
-            try:
-                logger.info(f"分析股票: {stock['code']} - {stock['name']}")
-                result = analyze_stock(stock['code'], stock['name'])
-                if result:
-                    save_analysis_result(result)
-                    results.append(result)
-            except Exception as e:
-                logger.error(f"分析股票 {stock['code']} 失败: {str(e)}")
-        
-        # 导出到CSV
-        if results:
-            filename = export_to_csv(results)
-            logger.info(f"手动分析完成，结果已导出到: {filename}")
-        
-    except Exception as e:
-        logger.error(f"手动分析任务执行失败: {str(e)}")
-
-
-@app.get("/analysis/latest", summary="获取最新分析结果")
-async def get_analysis():
-    """获取最新的分析结果"""
-    try:
-        results = get_latest_analysis()
-        return {
-            "total": len(results),
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "results": results
-        }
-    except Exception as e:
-        logger.error(f"获取分析结果失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"获取失败: {str(e)}")
-
-
-@app.get("/export/csv", summary="下载最新分析结果CSV")
-async def download_csv():
-    """下载最新的分析结果CSV文件"""
-    try:
-        results = get_latest_analysis()
-        if not results:
-            raise HTTPException(status_code=404, detail="暂无分析结果")
-        
-        filename = export_to_csv(results)
-        return FileResponse(
-            path=filename,
-            filename=f"stock_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
-            media_type="text/csv"
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"导出CSV失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
-
-
-@app.get("/health", summary="健康检查")
-async def health_check():
-    """系统健康检查"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "scheduler_running": scheduler.running
-    }
-
+# 每天凌晨 1 点执行全量分析
+scheduler.add_job(lambda: asyncio.run(start_full_analysis()), 'cron', hour=1, minute=0)
+scheduler.start()
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=config.HOST,
-        port=config.PORT,
-        reload=config.RELOAD,
-        log_level=config.LOG_LEVEL.lower()
-    )
+    import uvicorn
+    # 强制不使用系统代理防止报错 (如果需要)
+    os.environ['no_proxy'] = '*'
+    uvicorn.run(app, host="0.0.0.0", port=8000)
