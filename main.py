@@ -22,7 +22,7 @@ os.environ['HTTPS_PROXY'] = ''
 os.environ['no_proxy'] = '*'
 
 # --- 1. 数据库配置 ---
-SQLALCHEMY_DATABASE_URL = "sqlite:///./stock_final_v10.db"
+SQLALCHEMY_DATABASE_URL = "sqlite:///./stock_pro_system.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
