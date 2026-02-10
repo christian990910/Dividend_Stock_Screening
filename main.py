@@ -19,10 +19,11 @@ from database import (
 )
 from analysis import analyze_stock, fetch_stock_data
 from utils import export_to_csv
+import config
 
 # 配置日志
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, config.LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -63,20 +64,24 @@ async def startup_event():
     # 每日定时分析（每天早上9点执行）
     scheduler.add_job(
         daily_analysis_job,
-        trigger=CronTrigger(hour=9, minute=0),
+        trigger=CronTrigger(hour=config.DAILY_ANALYSIS_HOUR, minute=config.DAILY_ANALYSIS_MINUTE),
         id='daily_analysis',
         name='每日股票分析任务',
-        replace_existing=True
+        replace_existing=True,
+        max_instances=1,
+        misfire_grace_time=300  # 错过5分钟内仍执行
     )
     
-    # 每30秒获取一次数据（用于实时更新）
+    # 每60秒获取一次数据（避免频繁请求）
     scheduler.add_job(
         fetch_data_job,
         trigger='interval',
-        seconds=30,
+        seconds=config.DATA_FETCH_INTERVAL,
         id='fetch_data',
         name='定时获取股票数据',
-        replace_existing=True
+        replace_existing=True,
+        max_instances=1,  # 最多只运行1个实例
+        misfire_grace_time=15  # 错过触发时间15秒内仍执行
     )
     
     scheduler.start()
@@ -125,14 +130,32 @@ def fetch_data_job():
     """定时获取股票数据任务"""
     try:
         stocks = get_all_stocks()
+        if not stocks:
+            logger.debug("股票列表为空，跳过数据获取")
+            return
+        
+        logger.info(f"开始获取 {len(stocks)} 只股票的数据...")
+        success_count = 0
+        skip_count = 0
+        error_count = 0
+        
         for stock in stocks:
             try:
                 # 获取并保存历史数据
                 data = fetch_stock_data(stock['code'])
                 if data is not None and not data.empty:
                     save_historical_data(stock['code'], data)
+                    success_count += 1
+                    logger.debug(f"✓ 成功获取: {stock['code']} - {stock['name']}")
+                elif data is None:
+                    skip_count += 1
+                    logger.debug(f"⊘ 跳过（限流）: {stock['code']} - {stock['name']}")
             except Exception as e:
-                logger.error(f"获取股票 {stock['code']} 数据失败: {str(e)}")
+                error_count += 1
+                logger.error(f"✗ 获取股票 {stock['code']} 数据失败: {str(e)}")
+        
+        logger.info(f"数据获取完成 - 成功: {success_count}, 跳过: {skip_count}, 失败: {error_count}")
+            
     except Exception as e:
         logger.error(f"定时获取数据任务失败: {str(e)}")
 
@@ -319,8 +342,8 @@ async def health_check():
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
+        host=config.HOST,
+        port=config.PORT,
+        reload=config.RELOAD,
+        log_level=config.LOG_LEVEL.lower()
     )

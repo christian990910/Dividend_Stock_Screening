@@ -9,12 +9,16 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import logging
 import time
+from requests.exceptions import ProxyError, ConnectionError, Timeout
+import config
 
 logger = logging.getLogger(__name__)
 
-# 请求间隔控制（30秒）
+# 请求间隔控制
 LAST_REQUEST_TIME = {}
-REQUEST_INTERVAL = 30
+REQUEST_INTERVAL = config.REQUEST_INTERVAL
+MAX_RETRIES = config.MAX_RETRIES
+RETRY_DELAY = config.RETRY_DELAY
 
 
 def fetch_stock_data(code: str, adjust: str = "qfq") -> Optional[pd.DataFrame]:
@@ -30,27 +34,44 @@ def fetch_stock_data(code: str, adjust: str = "qfq") -> Optional[pd.DataFrame]:
         if code in LAST_REQUEST_TIME:
             elapsed = current_time - LAST_REQUEST_TIME[code]
             if elapsed < REQUEST_INTERVAL:
-                logger.info(f"股票 {code} 距离上次请求不足30秒，跳过")
+                logger.debug(f"股票 {code} 距离上次请求不足30秒，跳过")
                 return None
         
         LAST_REQUEST_TIME[code] = current_time
         
-        # 获取A股历史数据
+        # 获取A股历史数据 - 带重试机制
         logger.info(f"开始获取股票 {code} 的数据...")
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=(datetime.now() - timedelta(days=365)).strftime("%Y%m%d"),
-            end_date=datetime.now().strftime("%Y%m%d"),
-            adjust=adjust
-        )
         
-        if df is not None and not df.empty:
-            logger.info(f"成功获取股票 {code} 数据，共 {len(df)} 条")
-            return df
-        else:
-            logger.warning(f"股票 {code} 数据为空")
-            return None
+        for attempt in range(MAX_RETRIES):
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=(datetime.now() - timedelta(days=config.HISTORY_DAYS)).strftime("%Y%m%d"),
+                    end_date=datetime.now().strftime("%Y%m%d"),
+                    adjust=adjust
+                )
+                
+                if df is not None and not df.empty:
+                    logger.info(f"成功获取股票 {code} 数据，共 {len(df)} 条")
+                    return df
+                else:
+                    logger.warning(f"股票 {code} 数据为空")
+                    return None
+                    
+            except (ProxyError, ConnectionError, Timeout) as e:
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(f"获取股票 {code} 数据失败（尝试 {attempt + 1}/{MAX_RETRIES}），{RETRY_DELAY}秒后重试...")
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    logger.error(f"获取股票 {code} 数据失败，已达最大重试次数")
+                    return None
+            except Exception as e:
+                logger.error(f"获取股票 {code} 数据时出现未知错误: {str(e)}")
+                return None
+        
+        return None
             
     except Exception as e:
         logger.error(f"获取股票 {code} 数据失败: {str(e)}")
@@ -62,8 +83,19 @@ def fetch_stock_fundamental(code: str) -> Optional[Dict]:
     获取股票基本面数据（PE、PB、股息率等）
     """
     try:
-        # 获取个股信息
-        stock_info = ak.stock_individual_info_em(symbol=code)
+        # 获取个股信息 - 带重试机制
+        for attempt in range(MAX_RETRIES):
+            try:
+                stock_info = ak.stock_individual_info_em(symbol=code)
+                break
+            except (ProxyError, ConnectionError, Timeout) as e:
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(f"获取股票 {code} 基本面数据失败（尝试 {attempt + 1}/{MAX_RETRIES}），{RETRY_DELAY}秒后重试...")
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    logger.error(f"获取股票 {code} 基本面数据失败，已达最大重试次数")
+                    return None
         
         result = {}
         if stock_info is not None and not stock_info.empty:
@@ -192,7 +224,7 @@ def analyze_stock(code: str, name: str) -> Optional[Dict]:
         fundamental = fetch_stock_fundamental(code)
         
         # 计算波动率
-        volatility = calculate_volatility(df, window=60)
+        volatility = calculate_volatility(df, window=config.VOLATILITY_WINDOW)
         
         # 获取PE、PB
         pe = None
@@ -332,7 +364,7 @@ def determine_buy_signal(
             reasons.append("估值合理，有成长潜力")
     
     # 判断是否买入（评分 >= 8 分）
-    buy_signal = score >= 8
+    buy_signal = score >= config.BUY_SIGNAL_THRESHOLD
     
     reason_text = "; ".join(reasons) if reasons else "无明显特征"
     reason_text = f"评分: {score}/13 - {reason_text}"

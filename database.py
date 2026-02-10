@@ -8,10 +8,11 @@ from datetime import datetime
 import pandas as pd
 import json
 import logging
+import config
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "stock_analysis.db"
+DB_PATH = config.DB_PATH
 
 
 def get_connection():
