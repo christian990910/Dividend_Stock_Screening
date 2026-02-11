@@ -1,5 +1,6 @@
 import os
 import time
+from contextlib import asynccontextmanager
 import datetime
 import asyncio
 import re
@@ -9,18 +10,46 @@ import numpy as np
 import akshare as ak
 from typing import Optional, List
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, desc, func, Boolean, Date
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from starlette.background import BackgroundTasks
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import urllib3
+import random
+import efinance as ef
 
 # ============================================================
 # 网络配置 - 禁用代理和SSL警告
 # ============================================================
+# ============================================================
+# 顶级补丁：全局拦截 requests，强制伪装并禁用代理
+# ============================================================
+from requests.sessions import Session
+
+_orig_request = Session.request
+
+def my_request(self, method, url, **kwargs):
+    # 1. 强制抹除代理 (解决 RemoteDisconnected 的核心)
+    kwargs['proxies'] = {'http': None, 'https': None}
+    
+    # 2. 注入伪装 Headers (如果接口没传 headers，我们就给它一个)
+    if 'headers' not in kwargs or not kwargs['headers']:
+        kwargs['headers'] = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
+        }
+    
+    # 3. 延长超时
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = 30
+        
+    return _orig_request(self, method, url, **kwargs)
+
+# 实施全局拦截：从此所有调用 requests 的库 (akshare, efinance) 都会带上伪装
+Session.request = my_request
 
 # 方法1: 环境变量禁用代理
 os.environ['HTTP_PROXY'] = ''
@@ -192,141 +221,206 @@ def retry_on_error(max_retries=3, delay=2, backoff=2):
 # ============================================================
 
 class StockDataService:
-    """股票数据服务"""
-    
     def __init__(self):
         self.last_market_fetch = None
-    
+        # 定义东财字段与数据库字段的映射
+        self.em_fields_map = {
+            'f12': 'code', 'f14': 'name', 'f2': 'latest_price', 'f3': 'change_pct',
+            'f4': 'change_amount', 'f5': 'volume', 'f6': 'amount', 'f7': 'amplitude',
+            'f15': 'high', 'f16': 'low', 'f17': 'open', 'f18': 'close_prev',
+            'f8': 'turnover_rate', 'f9': 'pe_dynamic', 'f23': 'pb',
+            'f20': 'total_market_cap', 'f21': 'circulating_market_cap',
+            'f11': 'rise_speed', 'f22': 'change_5min'
+        }
+
     def get_db(self) -> Session:
-        """获取数据库会话"""
         db = SessionLocal()
-        try:
-            return db
-        finally:
-            pass
-    
-    @retry_on_error(max_retries=3, delay=3, backoff=2)
-    async def fetch_daily_market_data(self, force: bool = False) -> dict:
-        db = self.get_db()
-        try:
-            today = datetime.date.today()
-            existing = db.query(DailyMarketData).filter(DailyMarketData.date == today).first()
-            if existing and not force:
-                db.close()
-                return {"status": "skip", "message": "今日数据已存在"}
-
-            print(f"\n{'='*60}\n📊 开始获取全市场数据...")
-            
-            df = None
-            source_used = "eastmoney"
-            
-            # 1. 尝试调用东方财富 (字段丰富)
-            try:
-                print("尝试调用 AkShare 东方财富接口...")
-                df = ak.stock_zh_a_spot_em()
-                if df.empty: raise ValueError("Empty DF")
-                print("✅ 东方财富接口调用成功")
-            except Exception as e:
-                print(f"⚠️ 东方财富接口失败: {e}，正在切换新浪接口...")
-                # 2. 备选方案：调用新浪 (字段较少)
-                df = ak.stock_zh_a_spot()
-                source_used = "sina"
-                if df.empty:
-                    db.close()
-                    return {"status": "error", "message": "所有接口均未获取到数据"}
-                print(f"✅ 新浪接口调用成功 (获取 {len(df)} 条)")
-
-            # 3. 数据标准化处理
-            print(f"正在转换 {source_used} 数据格式...")
-            standard_data = []
-            
-            for _, row in df.iterrows():
-                if source_used == "eastmoney":
-                    # 东方财富映射逻辑
-                    m = DailyMarketData(
-                        date=today,
-                        code=str(row['代码']),
-                        name=str(row['名称']),
-                        latest_price=self._safe_float(row.get('最新价')),
-                        change_pct=self._safe_float(row.get('涨跌幅')),
-                        change_amount=self._safe_float(row.get('涨跌额')),
-                        volume=self._safe_float(row.get('成交量')),
-                        amount=self._safe_float(row.get('成交额')),
-                        amplitude=self._safe_float(row.get('振幅')),
-                        high=self._safe_float(row.get('最高')),
-                        low=self._safe_float(row.get('最低')),
-                        open=self._safe_float(row.get('今开')),
-                        close_prev=self._safe_float(row.get('昨收')),
-                        volume_ratio=self._safe_float(row.get('量比')),
-                        turnover_rate=self._safe_float(row.get('换手率')),
-                        pe_dynamic=self._safe_float(row.get('市盈率-动态')),
-                        pb=self._safe_float(row.get('市净率')),
-                        total_market_cap=self._safe_float(row.get('总市值')),
-                        circulating_market_cap=self._safe_float(row.get('流通市值')),
-                    )
-                else:
-                    # 新浪映射逻辑 (处理代码前缀 sh/sz 并补充缺失字段)
-                    raw_code = str(row['代码'])
-                    clean_code = re.sub(r'\D', '', raw_code) # 提取纯数字代码
-                    
-                    # 尝试计算振幅: (最高-最低)/昨收*100
-                    high = self._safe_float(row.get('最高'))
-                    low = self._safe_float(row.get('最低'))
-                    prev_close = self._safe_float(row.get('昨收'))
-                    calc_amplitude = 0
-                    if prev_close and prev_close > 0:
-                        calc_amplitude = round((high - low) / prev_close * 100, 2)
-
-                    m = DailyMarketData(
-                        date=today,
-                        code=clean_code,
-                        name=str(row['名称']),
-                        latest_price=self._safe_float(row.get('最新价')),
-                        change_pct=self._safe_float(row.get('涨跌幅')),
-                        change_amount=self._safe_float(row.get('涨跌额')),
-                        volume=self._safe_float(row.get('成交量')),
-                        amount=self._safe_float(row.get('成交额')),
-                        amplitude=calc_amplitude, # 新浪无振幅，手动计算
-                        high=high,
-                        low=low,
-                        open=self._safe_float(row.get('今开')),
-                        close_prev=prev_close,
-                        # 新浪缺失字段填充 None
-                        volume_ratio=None,
-                        turnover_rate=None,
-                        pe_dynamic=None,
-                        pb=None,
-                        total_market_cap=None,
-                        circulating_market_cap=None,
-                    )
-                standard_data.append(m)
-
-            # 4. 批量保存
-            if force and existing:
-                db.query(DailyMarketData).filter(DailyMarketData.date == today).delete()
-            
-            batch_size = 500
-            for i in range(0, len(standard_data), batch_size):
-                batch = standard_data[i : i + batch_size]
-                db.bulk_save_objects(batch)
-                db.commit()
-                print(f"  进度: {min(i+batch_size, len(standard_data))}/{len(standard_data)}")
-
-            db.close()
-            return {"status": "success", "source": source_used, "count": len(standard_data)}
-            
-        except Exception as e:
-            if db: db.close()
-            print(f"❌ 最终失败: {str(e)}")
-            raise
+        try: return db
+        finally: pass
 
     def _safe_float(self, val):
         """安全转换 float 辅助函数"""
         try:
-            if pd.isna(val) or val is None: return None
+            if pd.isna(val) or val == '-' or val is None: return None
             return float(val)
         except:
             return None
+
+    async def fetch_em_data_via_web_api(self, page_size: int = 100) -> pd.DataFrame:
+        """【方案一】原生网页 API 分页请求方式"""
+        all_dfs = []
+        current_page = 1
+        total_pages = 999
+        
+        url = "http://82.push2.eastmoney.com/api/qt/clist/get"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Referer": "http://quote.eastmoney.com/center/gridlist.html"
+        }
+
+        print(f"\n🌐 启动原生网页 API 抓取模式 (每页 {page_size} 条)")
+        
+        while current_page <= total_pages:
+            params = {
+                "pn": current_page, "pz": page_size,
+                "po": "1", "np": "1", "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": "2", "invt": "2", "fid": "f3",
+                "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+                "fields": ",".join(self.em_fields_map.keys()),
+            }
+
+            try:
+                print(f"   ➤ 抓取第 {current_page}/{total_pages if total_pages != 999 else '?'} 页...")
+                response = await asyncio.to_thread(
+                    requests.get, 
+                    url, 
+                    params=params, 
+                    headers=headers, 
+                    timeout=20
+                )
+                res_json = response.json()
+                
+                if not res_json or 'data' not in res_json or res_json['data'] is None:
+                    print(f"   ⚠️ 第 {current_page} 页未能获取有效数据")
+                    break
+
+                # 首页请求时更新总页数
+                if current_page == 1:
+                    total_records = res_json['data']['total']
+                    total_pages = (total_records + page_size - 1) // page_size
+                    print(f"   📊 全市场共计 {total_records} 只股票，预计爬取 {total_pages} 页")
+
+                batch_df = pd.DataFrame(res_json['data']['diff'])
+                all_dfs.append(batch_df)
+                
+                if current_page >= total_pages: break
+
+                # 核心要求：随机间隔 10-50 秒
+                wait_time = random.uniform(10, 50)
+                print(f"   💤 随机等待 {wait_time:.1f} 秒以规避风控...")
+                await asyncio.sleep(wait_time)
+                
+                current_page += 1
+
+            except Exception as e:
+                print(f"   ❌ 第 {current_page} 页出错: {str(e)[:50]}。60秒后重试...")
+                await asyncio.sleep(60)
+                continue
+
+        if not all_dfs: return pd.DataFrame()
+        
+        final_df = pd.concat(all_dfs, ignore_index=True)
+        # 统一字段名
+        final_df = final_df.rename(columns={k: v for k, v in self.em_fields_map.items()})
+        return final_df
+
+    async def fetch_via_efinance(self) -> pd.DataFrame:
+        """【方案二/保底方案】使用 efinance 库获取数据"""
+        print("\n🔄 切换至 efinance 保底模式获取全量数据...")
+        try:
+            # efinance 的获取通常比较快，因为它内部做了多线程/并发优化
+            df = ef.stock.get_realtime_quotes()
+            if df.empty: return pd.DataFrame()
+            
+            # 将 efinance 的中文列名映射回系统统一的英文名
+            ef_map = {
+                '股票代码': 'code', '股票名称': 'name', '最新价': 'latest_price',
+                '涨跌幅': 'change_pct', '涨跌额': 'change_amount', '成交量': 'volume',
+                '成交额': 'amount', '振幅': 'amplitude', '最高': 'high', '最低': 'low',
+                '今开': 'open', '昨收': 'close_prev', '换手率': 'turnover_rate',
+                '动态市盈率': 'pe_dynamic', '市净率': 'pb', '总市值': 'total_market_cap',
+                '流通市值': 'circulating_market_cap', '涨速': 'rise_speed'
+            }
+            df = df.rename(columns=ef_map)
+            print(f"   ✅ efinance 成功获取 {len(df)} 条数据")
+            return df
+        except Exception as e:
+            print(f"   ❌ efinance 模式也失效: {e}")
+            return pd.DataFrame()
+
+    @retry_on_error(max_retries=2, delay=5)
+    async def fetch_daily_market_data(self, force: bool = False) -> dict:
+        """主入口：具备切换机制的获取逻辑"""
+        db = self.get_db()
+        today = datetime.date.today()
+        
+        # 1. 检查今日是否已有数据
+        if not force:
+            existing = db.query(DailyMarketData).filter(DailyMarketData.date == today).first()
+            if existing:
+                db.close()
+                return {"status": "skip", "message": "今日数据已存在"}
+
+        print(f"\n{'='*60}\n📊 开始执行每日全市场数据采集程序")
+        
+        # 2. 尝试方案一（原生 API）
+        try:
+            df = await self.fetch_em_data_via_web_api(page_size=100)
+            source = "EM_WebAPI"
+        except Exception as e:
+            print(f"⚠️ 方案一失败，正在启动方案二...")
+            df = pd.DataFrame()
+
+        # 3. 尝试方案二（efinance）
+        if df.empty:
+            df = await self.fetch_via_efinance()
+            source = "efinance"
+
+        if df.empty:
+            db.close()
+            return {"status": "error", "message": "所有数据源均不可用"}
+
+        # 4. 数据清理与保存
+        try:
+            # 清理旧数据
+            db.query(DailyMarketData).filter(DailyMarketData.date == today).delete()
+            db.commit()
+
+            print(f"\n💾 正在将 {len(df)} 只股票存入数据库...")
+            batch_data = []
+            for _, row in df.iterrows():
+                # 使用 _safe_float 处理各种异常值
+                m = DailyMarketData(
+                    date=today,
+                    code=str(row['code']),
+                    name=str(row['name']),
+                    latest_price=self._safe_float(row.get('latest_price')),
+                    change_pct=self._safe_float(row.get('change_pct')),
+                    change_amount=self._safe_float(row.get('change_amount')),
+                    volume=self._safe_float(row.get('volume')),
+                    amount=self._safe_float(row.get('amount')),
+                    amplitude=self._safe_float(row.get('amplitude')),
+                    high=self._safe_float(row.get('high')),
+                    low=self._safe_float(row.get('low')),
+                    open=self._safe_float(row.get('open')),
+                    close_prev=self._safe_float(row.get('close_prev')),
+                    turnover_rate=self._safe_float(row.get('turnover_rate')),
+                    pe_dynamic=self._safe_float(row.get('pe_dynamic')),
+                    pb=self._safe_float(row.get('pb')),
+                    total_market_cap=self._safe_float(row.get('total_market_cap')),
+                    circulating_market_cap=self._safe_float(row.get('circulating_market_cap')),
+                    rise_speed=self._safe_float(row.get('rise_speed')),
+                    updated_at=datetime.datetime.now()
+                )
+                batch_data.append(m)
+                
+                if len(batch_data) >= 500:
+                    db.bulk_save_objects(batch_data)
+                    db.commit()
+                    batch_data = []
+
+            if batch_data:
+                db.bulk_save_objects(batch_data)
+                db.commit()
+
+            print(f"✅ 数据采集完成！来源: {source}, 总计: {len(df)} 条")
+            db.close()
+            return {"status": "success", "source": source, "count": len(df)}
+
+        except Exception as e:
+            db.close()
+            print(f"❌ 存储入库失败: {e}")
+            raise
     
     @retry_on_error(max_retries=2, delay=2)
     async def fetch_historical_data(self, stock_code: str, start_date: str = None, 
@@ -340,66 +434,114 @@ class StockDataService:
             if not end_date:
                 end_date = datetime.date.today().strftime("%Y%m%d")
             if not start_date:
-                start_date = (datetime.date.today() - datetime.timedelta(days=180)).strftime("%Y%m%d")
+                start_date = (datetime.date.today() - datetime.timedelta(days=500)).strftime("%Y%m%d")
             
             print(f"📈 获取 {stock_code} 历史数据: {start_date} 至 {end_date}")
             
-            # 调用akshare接口 - 前复权
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period=period,
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-            
+            df = pd.DataFrame()
+            data_source = ""
+
+            # --- 方案 1: 优先尝试 efinance (稳定性高，带伪装) ---
+            try:
+                # efinance 的 get_quote_history 会自动处理复权，默认是前复权
+                df = ef.stock.get_quote_history(stock_code)
+                if not df.empty:
+                    # efinance 返回的是全量，我们需要按日期过滤
+                    # 将 '日期' 列转换为字符串格式以便对比，或者统一转为 datetime
+                    df['日期'] = pd.to_datetime(df['日期'])
+                    # 转换 start_date 和 end_date 为 datetime 对象
+                    s_dt = pd.to_datetime(start_date, format='%Y%m%d')
+                    e_dt = pd.to_datetime(end_date, format='%Y%m%d')
+                    
+                    df = df[(df['日期'] >= s_dt) & (df['日期'] <= e_dt)]
+                    
+                    # 映射 efinance 的中文列名到数据库字段名
+                    df = df.rename(columns={
+                        '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low',
+                        '成交量': 'volume', '成交额': 'amount', '振幅': 'amplitude',
+                        '涨跌幅': 'change_pct', '涨跌额': 'change_amount', '换手率': 'turnover_rate'
+                    })
+                    data_source = "efinance"
+            except Exception as e:
+                print(f"   ⚠️ efinance 获取失败: {e}，尝试切换 AkShare...")
+
+            # --- 方案 2: AkShare 保底 ---
+            if df.empty:
+                try:
+                    df = ak.stock_zh_a_hist(
+                        symbol=stock_code,
+                        period=period,
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust="qfq"
+                    )
+                    if not df.empty:
+                        # AkShare 的列名也是中文，需要映射
+                        df = df.rename(columns={
+                            '日期': '日期', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low',
+                            '成交量': 'volume', '成交额': 'amount', '振幅': 'amplitude',
+                            '涨跌幅': 'change_pct', '涨跌额': 'change_amount', '换手率': 'turnover_rate'
+                        })
+                        data_source = "akshare"
+                except Exception as e:
+                    print(f"   ❌ AkShare 保底也失败: {e}")
+
             if df.empty:
                 db.close()
                 return {"status": "error", "message": f"股票 {stock_code} 无历史数据"}
             
-            # 删除该股票在此时间段的旧数据
+            # --- 数据入库逻辑 ---
+            # 删除旧数据
+            target_start = datetime.datetime.strptime(start_date, "%Y%m%d").date()
+            target_end = datetime.datetime.strptime(end_date, "%Y%m%d").date()
+            
             db.query(HistoricalData).filter(
                 HistoricalData.stock_code == stock_code,
-                HistoricalData.date >= datetime.datetime.strptime(start_date, "%Y%m%d").date(),
-                HistoricalData.date <= datetime.datetime.strptime(end_date, "%Y%m%d").date()
+                HistoricalData.date >= target_start,
+                HistoricalData.date <= target_end
             ).delete()
             
-            # 批量插入
             count = 0
             for _, row in df.iterrows():
+                # 处理日期：efinance 返回可能是 Timestamp
+                raw_date = row['日期']
+                if isinstance(raw_date, pd.Timestamp):
+                    final_date = raw_date.date()
+                else:
+                    final_date = datetime.datetime.strptime(str(raw_date), "%Y-%m-%d").date()
+
                 hist_data = HistoricalData(
                     stock_code=stock_code,
-                    date=datetime.datetime.strptime(str(row['日期']), "%Y-%m-%d").date(),
-                    open=float(row['开盘']) if pd.notna(row['开盘']) else None,
-                    close=float(row['收盘']) if pd.notna(row['收盘']) else None,
-                    high=float(row['最高']) if pd.notna(row['最高']) else None,
-                    low=float(row['最低']) if pd.notna(row['最低']) else None,
-                    volume=int(row['成交量']) if pd.notna(row['成交量']) else None,
-                    amount=float(row['成交额']) if pd.notna(row['成交额']) else None,
-                    amplitude=float(row['振幅']) if pd.notna(row['振幅']) else None,
-                    change_pct=float(row['涨跌幅']) if pd.notna(row['涨跌幅']) else None,
-                    change_amount=float(row['涨跌额']) if pd.notna(row['涨跌额']) else None,
-                    turnover_rate=float(row['换手率']) if pd.notna(row['换手率']) else None,
+                    date=final_date,
+                    open=self._safe_float(row.get('open')),
+                    close=self._safe_float(row.get('close')),
+                    high=self._safe_float(row.get('high')),
+                    low=self._safe_float(row.get('low')),
+                    volume=int(row.get('volume', 0)) if pd.notna(row.get('volume')) else 0,
+                    amount=self._safe_float(row.get('amount')),
+                    amplitude=self._safe_float(row.get('amplitude')),
+                    change_pct=self._safe_float(row.get('change_pct')),
+                    change_amount=self._safe_float(row.get('change_amount')),
+                    turnover_rate=self._safe_float(row.get('turnover_rate')),
                 )
                 db.add(hist_data)
                 count += 1
             
             db.commit()
             db.close()
-            
-            print(f"   ✓ 保存 {count} 条历史数据")
+            print(f"   ✓ 来源[{data_source}] 保存 {count} 条历史数据")
             
             return {
                 "status": "success",
-                "message": f"成功获取 {stock_code} 历史数据",
+                "source": data_source,
                 "count": count,
                 "start_date": start_date,
                 "end_date": end_date
             }
             
         except Exception as e:
-            db.close()
-            print(f"   ✗ 获取失败: {str(e)}")
+            if db: db.close()
+            print(f"   ✗ 获取历史数据流程崩溃: {str(e)}")
             raise
     
     async def fetch_dividend_data(self, date_str: str = None) -> dict:
@@ -458,7 +600,24 @@ class StockDataService:
         except Exception as e:
             db.close()
             return {"status": "error", "message": f"获取分红数据失败: {str(e)}"}
-    
+        
+    async def fetch_stock_financials(self, stock_code: str):
+        """获取个股关键财务指标 (ROE, 净利增长)"""
+        try:
+            # 使用 efinance 获取基础信息 (包含 ROE 等)
+            # 注意：ef.stock.get_base_info 返回的是 DataFrame
+            df = await asyncio.to_thread(ef.stock.get_base_info, stock_code)
+            if df.empty: return 0.0, 0.0
+            
+            # 这里的字段名通常是：'净资产收益率(%)', '净利润同比(%)'
+            # 不同版本的 efinance 字段名可能有细微差别，建议加个 try-catch
+            roe = self._safe_float(df.iloc[0].get('净资产收益率(%)', 0))
+            growth = self._safe_float(df.iloc[0].get('净利润同比(%)', 0))
+            return roe, growth
+        except:
+            print(f"      ⚠️ 财务数据获取失败 ({stock_code}): {e}")
+            return 0.0, 0.0
+        
     async def analyze_stock(self, stock_code: str, db: Session = None) -> dict:
         """分析单只股票"""
         should_close = False
@@ -552,48 +711,48 @@ class StockDataService:
                     data_source = "mixed"
             
             # 4. ROE和成长性
-            roe = 0
-            profit_growth = 0
+            print(f"   正在获取 {stock_code} 财务数据...")
+            roe, profit_growth = await self.fetch_stock_financials(stock_code)
             
-            # 5. 评分系统
+            # --- 5. 综合评分系统 ---
+            
+            # (A) 波动率评分 (最高 40分) - 越低分越高，代表稳健
             volatility_score = 0
             if volatility_30d > 0:
-                if volatility_30d < 20:
-                    volatility_score = 40
-                elif volatility_30d < 30:
-                    volatility_score = 30
-                elif volatility_30d < 40:
-                    volatility_score = 20
-                elif volatility_30d < 50:
-                    volatility_score = 10
+                if volatility_30d < 20: volatility_score = 40
+                elif volatility_30d < 30: volatility_score = 30
+                elif volatility_30d < 40: volatility_score = 20
+                elif volatility_30d < 50: volatility_score = 10
             
+            # (B) 股息率评分 (最高 30分) - 现金红利能力
             dividend_score = 0
-            if dividend_yield >= 5:
-                dividend_score = 30
-            elif dividend_yield >= 4:
-                dividend_score = 25
-            elif dividend_yield >= 3:
-                dividend_score = 20
-            elif dividend_yield >= 2:
-                dividend_score = 15
-            elif dividend_yield >= 1:
-                dividend_score = 10
+            if dividend_yield >= 5: dividend_score = 30
+            elif dividend_yield >= 4: dividend_score = 25
+            elif dividend_yield >= 3: dividend_score = 20
+            elif dividend_yield >= 2: dividend_score = 15
+            elif dividend_yield >= 1: dividend_score = 10
             
+            # (C) 成长性评分 (最高 30分) - ROE(20分) + 利润增长(10分)
             growth_score = 0
-            if roe > 15:
-                growth_score = 30
-            elif roe > 12:
-                growth_score = 25
-            elif roe > 10:
-                growth_score = 20
-            elif roe > 8:
-                growth_score = 15
-            elif roe > 5:
-                growth_score = 10
             
+            # ROE 子项 (20分)
+            if roe > 15: growth_score += 20
+            elif roe > 10: growth_score += 15
+            elif roe > 5: growth_score += 10
+            elif roe > 0: growth_score += 5
+            
+            # 利润增长子项 (10分)
+            if profit_growth > 20: growth_score += 10
+            elif profit_growth > 10: growth_score += 7
+            elif profit_growth > 0: growth_score += 4
+            
+            # --- 总分计算 ---
             total_score = volatility_score + dividend_score + growth_score
             
-            if total_score >= 70:
+            # --- 投资建议逻辑 ---
+            if total_score >= 80:
+                suggestion = "🌟 极高价值 (财务强健+高分红+低波动)"
+            elif total_score >= 70:
                 suggestion = "强烈推荐"
             elif total_score >= 60:
                 suggestion = "推荐"
@@ -602,7 +761,7 @@ class StockDataService:
             elif total_score >= 40:
                 suggestion = "观望"
             else:
-                suggestion = "不推荐"
+                suggestion = "不推荐 (风险较高或价值不足)"
             
             # 6. 保存分析结果
             analysis_result = StockAnalysisResult(
@@ -693,38 +852,54 @@ class StockDataService:
             return {"status": "error", "message": f"批量分析失败: {str(e)}"}
 
 
-# --- FastAPI应用 ---
-app = FastAPI(title="价值分析系统 v2.1", version="2.1")
+
 stock_service = StockDataService()
 
 scheduler = AsyncIOScheduler()
 
-@app.on_event("startup")
-async def startup_event():
-    """启动时初始化定时任务"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+
+    # ================= 启动阶段 =================
+    print("\n🚀 正在启动价值分析系统...\n")
+
     scheduler.add_job(
         stock_service.fetch_daily_market_data,
         CronTrigger(hour=15, minute=30),
         id="daily_market_fetch",
         replace_existing=True
     )
-    
+
     scheduler.add_job(
         stock_service.analyze_all_watched_stocks,
         CronTrigger(hour=16, minute=0),
         id="daily_analysis",
         replace_existing=True
     )
-    
+
     scheduler.start()
-    print("\n✅ 定时任务已启动:")
+
+    print("✅ 定时任务已启动:")
     print("   - 每日15:30获取全市场数据")
     print("   - 每日16:00分析所有关注股票\n")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """关闭时停止定时任务"""
-    scheduler.shutdown()
+    yield  # 👈 关键：生命周期分界线
+
+    # ================= 关闭阶段 =================
+    print("\n🛑 正在关闭系统...")
+
+    if scheduler and scheduler.running:
+        scheduler.shutdown()
+
+    print("✅ 定时任务已安全停止\n")
+
+# --- FastAPI应用 ---
+app = FastAPI(
+    title="价值分析系统 v2.1",
+    version="2.1",
+    lifespan=lifespan
+)
 
 # --- API接口 ---
 
@@ -890,7 +1065,12 @@ def export_global_csv():
             })
         
         df = pd.DataFrame(data)
-        output_file = "/mnt/user-data/outputs/全局股票分析结果.csv"
+        out_dir = "outputs"
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+            
+        df = pd.DataFrame(data)
+        output_file = os.path.join(out_dir, "全局股票分析结果.csv")
         df.to_csv(output_file, index=False, encoding="utf_8_sig")
         
         db.close()
@@ -951,11 +1131,16 @@ def export_user_csv(user_id: str):
             })
         
         df = pd.DataFrame(data)
-        output_file = f"/mnt/user-data/outputs/用户{user_id}_股票分析结果.csv"
+        out_dir = "outputs"
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+            
+        df = pd.DataFrame(data)
+        output_file = os.path.join(out_dir, "用户{user_id}_股票分析结果.csv")
         df.to_csv(output_file, index=False, encoding="utf_8_sig")
         
         db.close()
-        return FileResponse(output_file, filename=f"用户{user_id}_股票分析结果.csv")
+        return FileResponse(output_file, filename="用户{user_id}_股票分析结果.csv")
         
     except Exception as e:
         db.close()
