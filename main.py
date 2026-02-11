@@ -225,7 +225,6 @@ class StockDataService:
             print("❌ 刷新 ut 失败:", e)
             return False
 
-
     async def fetch_em_data_via_web_api(self, page_size: int = 100) -> pd.DataFrame:
         all_dfs = []
         current_page = 1
@@ -298,8 +297,38 @@ class StockDataService:
                 res_json = json.loads(json_str)
 
                 if not res_json or not res_json.get("data"):
-                    print("   ⚠️ 数据为空，可能 ut 或 cookie 失效")
-                    break
+                    print("⚠️ 数据为空，可能 ut 失效，尝试刷新...")
+
+                    # 尝试刷新 ut
+                    if self.refresh_ut():
+                        print("🔁 使用新 ut 重试当前页...")
+
+                        params["ut"] = self.target_ut
+
+                        response = await asyncio.to_thread(
+                            session.get,
+                            url,
+                            params=params,
+                            headers=headers,
+                            timeout=20,
+                            verify=False
+                        )
+
+                        raw_text = response.text
+                        json_match = re.search(r'jQuery.*?\((.*)\)', raw_text)
+
+                        if json_match:
+                            json_str = json_match.group(1)
+                            res_json = json.loads(json_str)
+
+                            if not res_json or not res_json.get("data"):
+                                print("❌ 刷新 ut 后仍失败")
+                                break
+                        else:
+                            print("❌ JSONP解析失败")
+                            break
+                    else:
+                        break
 
                 if current_page == 1:
                     total_records = res_json["data"]["total"]
