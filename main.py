@@ -16,8 +16,31 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import urllib3
 
-# --- 数据库配置 ---
+# ============================================================
+# 网络配置 - 禁用代理和SSL警告
+# ============================================================
+
+# 方法1: 环境变量禁用代理
+os.environ['HTTP_PROXY'] = ''
+os.environ['HTTPS_PROXY'] = ''
+os.environ['http_proxy'] = ''
+os.environ['https_proxy'] = ''
+os.environ['NO_PROXY'] = '*'
+os.environ['no_proxy'] = '*'
+
+# 方法2: 禁用urllib3的SSL警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 方法3: 禁用requests的代理(如果akshare内部使用requests)
+import requests
+requests.packages.urllib3.disable_warnings()
+
+# ============================================================
+# 数据库配置
+# ============================================================
+
 SQLALCHEMY_DATABASE_URL = "sqlite:///./stock_advanced_system.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -28,7 +51,7 @@ Base = declarative_base()
 class User(Base):
     """用户表"""
     __tablename__ = "users"
-    user_id = Column(String, primary_key=True)  # 用户ID
+    user_id = Column(String, primary_key=True)
     username = Column(String, unique=True)
     created_at = Column(DateTime, default=datetime.datetime.now)
 
@@ -36,70 +59,70 @@ class UserStockWatch(Base):
     """用户关注股票列表"""
     __tablename__ = "user_stock_watch"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String, index=True)  # 用户ID
-    stock_code = Column(String, index=True)  # 股票代码
+    user_id = Column(String, index=True)
+    stock_code = Column(String, index=True)
     added_at = Column(DateTime, default=datetime.datetime.now)
 
 class DailyMarketData(Base):
     """接口1: 每日全市场实时数据 - stock_zh_a_spot_em"""
     __tablename__ = "daily_market_data"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    date = Column(Date, index=True)  # 日期
-    code = Column(String, index=True)  # 代码
-    name = Column(String)  # 名称
-    latest_price = Column(Float)  # 最新价
-    change_pct = Column(Float)  # 涨跌幅
-    change_amount = Column(Float)  # 涨跌额
-    volume = Column(Float)  # 成交量(手)
-    amount = Column(Float)  # 成交额(元)
-    amplitude = Column(Float)  # 振幅
-    high = Column(Float)  # 最高
-    low = Column(Float)  # 最低
-    open = Column(Float)  # 今开
-    close_prev = Column(Float)  # 昨收
-    volume_ratio = Column(Float)  # 量比
-    turnover_rate = Column(Float)  # 换手率
-    pe_dynamic = Column(Float)  # 市盈率-动态
-    pb = Column(Float)  # 市净率
-    total_market_cap = Column(Float)  # 总市值
-    circulating_market_cap = Column(Float)  # 流通市值
-    rise_speed = Column(Float)  # 涨速
-    change_5min = Column(Float)  # 5分钟涨跌
-    change_60day = Column(Float)  # 60日涨跌幅
-    change_ytd = Column(Float)  # 年初至今涨跌幅
+    date = Column(Date, index=True)
+    code = Column(String, index=True)
+    name = Column(String)
+    latest_price = Column(Float)
+    change_pct = Column(Float)
+    change_amount = Column(Float)
+    volume = Column(Float)
+    amount = Column(Float)
+    amplitude = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    open = Column(Float)
+    close_prev = Column(Float)
+    volume_ratio = Column(Float)
+    turnover_rate = Column(Float)
+    pe_dynamic = Column(Float)
+    pb = Column(Float)
+    total_market_cap = Column(Float)
+    circulating_market_cap = Column(Float)
+    rise_speed = Column(Float)
+    change_5min = Column(Float)
+    change_60day = Column(Float)
+    change_ytd = Column(Float)
     updated_at = Column(DateTime, default=datetime.datetime.now)
 
 class HistoricalData(Base):
     """接口2: 历史行情数据 - stock_zh_a_hist (前复权)"""
     __tablename__ = "historical_data"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    stock_code = Column(String, index=True)  # 股票代码
-    date = Column(Date, index=True)  # 日期
-    open = Column(Float)  # 开盘
-    close = Column(Float)  # 收盘
-    high = Column(Float)  # 最高
-    low = Column(Float)  # 最低
-    volume = Column(Integer)  # 成交量(手)
-    amount = Column(Float)  # 成交额(元)
-    amplitude = Column(Float)  # 振幅
-    change_pct = Column(Float)  # 涨跌幅
-    change_amount = Column(Float)  # 涨跌额
-    turnover_rate = Column(Float)  # 换手率
+    stock_code = Column(String, index=True)
+    date = Column(Date, index=True)
+    open = Column(Float)
+    close = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    volume = Column(Integer)
+    amount = Column(Float)
+    amplitude = Column(Float)
+    change_pct = Column(Float)
+    change_amount = Column(Float)
+    turnover_rate = Column(Float)
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 class DividendData(Base):
     """接口3: 分红派息数据 - news_trade_notify_dividend_baidu"""
     __tablename__ = "dividend_data"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    stock_code = Column(String, index=True)  # 股票代码
-    stock_name = Column(String)  # 股票简称
-    ex_dividend_date = Column(Date, index=True)  # 除权日
-    dividend = Column(String)  # 分红
-    bonus_share = Column(String)  # 送股
-    capitalization = Column(String)  # 转增
-    physical = Column(String)  # 实物
-    exchange = Column(String)  # 交易所
-    report_period = Column(String)  # 报告期
+    stock_code = Column(String, index=True)
+    stock_name = Column(String)
+    ex_dividend_date = Column(Date, index=True)
+    dividend = Column(String)
+    bonus_share = Column(String)
+    capitalization = Column(String)
+    physical = Column(String)
+    exchange = Column(String)
+    report_period = Column(String)
     created_at = Column(DateTime, default=datetime.datetime.now)
 
 class StockAnalysisResult(Base):
@@ -110,38 +133,63 @@ class StockAnalysisResult(Base):
     stock_name = Column(String)
     analysis_date = Column(Date, index=True)
     
-    # 价格信息
     latest_price = Column(Float)
-    pe_ratio = Column(Float)  # 市盈率
-    pb_ratio = Column(Float)  # 市净率
+    pe_ratio = Column(Float)
+    pb_ratio = Column(Float)
     
-    # 波动率(基于历史数据计算)
-    volatility_30d = Column(Float)  # 30日波动率
-    volatility_60d = Column(Float)  # 60日波动率
+    volatility_30d = Column(Float)
+    volatility_60d = Column(Float)
     
-    # 股息率(基于分红数据计算)
-    dividend_yield = Column(Float)  # 年化股息率
+    dividend_yield = Column(Float)
     
-    # ROE和成长性(从市场数据补充)
     roe = Column(Float)
     profit_growth = Column(Float)
     
-    # 评分和建议
-    volatility_score = Column(Integer)  # 波动率评分 (0-40)
-    dividend_score = Column(Integer)  # 股息率评分 (0-30)
-    growth_score = Column(Integer)  # 成长性评分 (0-30)
-    total_score = Column(Integer)  # 总分 (0-100)
-    suggestion = Column(String)  # 建议
+    volatility_score = Column(Integer)
+    dividend_score = Column(Integer)
+    growth_score = Column(Integer)
+    total_score = Column(Integer)
+    suggestion = Column(String)
     
-    # 数据来源标记
-    data_source = Column(String)  # 主要数据来源: market/history/mixed
+    data_source = Column(String)
     
     created_at = Column(DateTime, default=datetime.datetime.now)
 
-# 创建所有表
 Base.metadata.create_all(bind=engine)
 
-# --- 数据服务层 ---
+# ============================================================
+# 重试装饰器
+# ============================================================
+
+def retry_on_error(max_retries=3, delay=2, backoff=2):
+    """
+    重试装饰器
+    max_retries: 最大重试次数
+    delay: 初始延迟秒数
+    backoff: 延迟倍数
+    """
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            current_delay = delay
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        # 最后一次重试失败,抛出异常
+                        raise e
+                    
+                    print(f"⚠️  第{attempt + 1}次尝试失败: {str(e)}")
+                    print(f"   等待{current_delay}秒后重试...")
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff
+            
+        return wrapper
+    return decorator
+
+# ============================================================
+# 数据服务层
+# ============================================================
 
 class StockDataService:
     """股票数据服务"""
@@ -157,91 +205,130 @@ class StockDataService:
         finally:
             pass
     
+    @retry_on_error(max_retries=3, delay=3, backoff=2)
     async def fetch_daily_market_data(self, force: bool = False) -> dict:
-        """
-        获取全市场每日数据 (接口1: stock_zh_a_spot_em)
-        默认每日15:30自动执行，可手动强制执行
-        """
         db = self.get_db()
         try:
             today = datetime.date.today()
-            
-            # 检查今天是否已经获取过数据
-            existing = db.query(DailyMarketData).filter(
-                DailyMarketData.date == today
-            ).first()
-            
+            existing = db.query(DailyMarketData).filter(DailyMarketData.date == today).first()
             if existing and not force:
                 db.close()
-                return {"status": "skip", "message": "今日数据已存在，使用 force=True 强制更新"}
+                return {"status": "skip", "message": "今日数据已存在"}
+
+            print(f"\n{'='*60}\n📊 开始获取全市场数据...")
             
-            print(f"开始获取全市场数据... 时间: {datetime.datetime.now()}")
+            df = None
+            source_used = "eastmoney"
             
-            # 调用akshare接口
-            df = ak.stock_zh_a_spot_em()
+            # 1. 尝试调用东方财富 (字段丰富)
+            try:
+                print("尝试调用 AkShare 东方财富接口...")
+                df = ak.stock_zh_a_spot_em()
+                if df.empty: raise ValueError("Empty DF")
+                print("✅ 东方财富接口调用成功")
+            except Exception as e:
+                print(f"⚠️ 东方财富接口失败: {e}，正在切换新浪接口...")
+                # 2. 备选方案：调用新浪 (字段较少)
+                df = ak.stock_zh_a_spot()
+                source_used = "sina"
+                if df.empty:
+                    db.close()
+                    return {"status": "error", "message": "所有接口均未获取到数据"}
+                print(f"✅ 新浪接口调用成功 (获取 {len(df)} 条)")
+
+            # 3. 数据标准化处理
+            print(f"正在转换 {source_used} 数据格式...")
+            standard_data = []
             
-            if df.empty:
-                db.close()
-                return {"status": "error", "message": "未获取到数据"}
-            
-            # 如果是强制更新，删除今天的旧数据
-            if force and existing:
-                db.query(DailyMarketData).filter(
-                    DailyMarketData.date == today
-                ).delete()
-                db.commit()
-            
-            # 批量插入数据
-            count = 0
             for _, row in df.iterrows():
-                market_data = DailyMarketData(
-                    date=today,
-                    code=str(row['代码']),
-                    name=str(row['名称']),
-                    latest_price=float(row['最新价']) if pd.notna(row['最新价']) else None,
-                    change_pct=float(row['涨跌幅']) if pd.notna(row['涨跌幅']) else None,
-                    change_amount=float(row['涨跌额']) if pd.notna(row['涨跌额']) else None,
-                    volume=float(row['成交量']) if pd.notna(row['成交量']) else None,
-                    amount=float(row['成交额']) if pd.notna(row['成交额']) else None,
-                    amplitude=float(row['振幅']) if pd.notna(row['振幅']) else None,
-                    high=float(row['最高']) if pd.notna(row['最高']) else None,
-                    low=float(row['最低']) if pd.notna(row['最低']) else None,
-                    open=float(row['今开']) if pd.notna(row['今开']) else None,
-                    close_prev=float(row['昨收']) if pd.notna(row['昨收']) else None,
-                    volume_ratio=float(row['量比']) if pd.notna(row['量比']) else None,
-                    turnover_rate=float(row['换手率']) if pd.notna(row['换手率']) else None,
-                    pe_dynamic=float(row['市盈率-动态']) if pd.notna(row['市盈率-动态']) else None,
-                    pb=float(row['市净率']) if pd.notna(row['市净率']) else None,
-                    total_market_cap=float(row['总市值']) if pd.notna(row['总市值']) else None,
-                    circulating_market_cap=float(row['流通市值']) if pd.notna(row['流通市值']) else None,
-                    rise_speed=float(row['涨速']) if pd.notna(row['涨速']) else None,
-                    change_5min=float(row['5分钟涨跌']) if pd.notna(row['5分钟涨跌']) else None,
-                    change_60day=float(row['60日涨跌幅']) if pd.notna(row['60日涨跌幅']) else None,
-                    change_ytd=float(row['年初至今涨跌幅']) if pd.notna(row['年初至今涨跌幅']) else None,
-                )
-                db.add(market_data)
-                count += 1
-                
-                # 每1000条提交一次
-                if count % 1000 == 0:
-                    db.commit()
-                    print(f"已保存 {count} 条数据...")
+                if source_used == "eastmoney":
+                    # 东方财富映射逻辑
+                    m = DailyMarketData(
+                        date=today,
+                        code=str(row['代码']),
+                        name=str(row['名称']),
+                        latest_price=self._safe_float(row.get('最新价')),
+                        change_pct=self._safe_float(row.get('涨跌幅')),
+                        change_amount=self._safe_float(row.get('涨跌额')),
+                        volume=self._safe_float(row.get('成交量')),
+                        amount=self._safe_float(row.get('成交额')),
+                        amplitude=self._safe_float(row.get('振幅')),
+                        high=self._safe_float(row.get('最高')),
+                        low=self._safe_float(row.get('最低')),
+                        open=self._safe_float(row.get('今开')),
+                        close_prev=self._safe_float(row.get('昨收')),
+                        volume_ratio=self._safe_float(row.get('量比')),
+                        turnover_rate=self._safe_float(row.get('换手率')),
+                        pe_dynamic=self._safe_float(row.get('市盈率-动态')),
+                        pb=self._safe_float(row.get('市净率')),
+                        total_market_cap=self._safe_float(row.get('总市值')),
+                        circulating_market_cap=self._safe_float(row.get('流通市值')),
+                    )
+                else:
+                    # 新浪映射逻辑 (处理代码前缀 sh/sz 并补充缺失字段)
+                    raw_code = str(row['代码'])
+                    clean_code = re.sub(r'\D', '', raw_code) # 提取纯数字代码
+                    
+                    # 尝试计算振幅: (最高-最低)/昨收*100
+                    high = self._safe_float(row.get('最高'))
+                    low = self._safe_float(row.get('最低'))
+                    prev_close = self._safe_float(row.get('昨收'))
+                    calc_amplitude = 0
+                    if prev_close and prev_close > 0:
+                        calc_amplitude = round((high - low) / prev_close * 100, 2)
+
+                    m = DailyMarketData(
+                        date=today,
+                        code=clean_code,
+                        name=str(row['名称']),
+                        latest_price=self._safe_float(row.get('最新价')),
+                        change_pct=self._safe_float(row.get('涨跌幅')),
+                        change_amount=self._safe_float(row.get('涨跌额')),
+                        volume=self._safe_float(row.get('成交量')),
+                        amount=self._safe_float(row.get('成交额')),
+                        amplitude=calc_amplitude, # 新浪无振幅，手动计算
+                        high=high,
+                        low=low,
+                        open=self._safe_float(row.get('今开')),
+                        close_prev=prev_close,
+                        # 新浪缺失字段填充 None
+                        volume_ratio=None,
+                        turnover_rate=None,
+                        pe_dynamic=None,
+                        pb=None,
+                        total_market_cap=None,
+                        circulating_market_cap=None,
+                    )
+                standard_data.append(m)
+
+            # 4. 批量保存
+            if force and existing:
+                db.query(DailyMarketData).filter(DailyMarketData.date == today).delete()
             
-            db.commit()
-            self.last_market_fetch = datetime.datetime.now()
-            
+            batch_size = 500
+            for i in range(0, len(standard_data), batch_size):
+                batch = standard_data[i : i + batch_size]
+                db.bulk_save_objects(batch)
+                db.commit()
+                print(f"  进度: {min(i+batch_size, len(standard_data))}/{len(standard_data)}")
+
             db.close()
-            return {
-                "status": "success",
-                "message": f"成功获取并保存 {count} 只股票的市场数据",
-                "count": count,
-                "date": str(today)
-            }
+            return {"status": "success", "source": source_used, "count": len(standard_data)}
             
         except Exception as e:
-            db.close()
-            return {"status": "error", "message": f"获取市场数据失败: {str(e)}"}
+            if db: db.close()
+            print(f"❌ 最终失败: {str(e)}")
+            raise
+
+    def _safe_float(self, val):
+        """安全转换 float 辅助函数"""
+        try:
+            if pd.isna(val) or val is None: return None
+            return float(val)
+        except:
+            return None
     
+    @retry_on_error(max_retries=2, delay=2)
     async def fetch_historical_data(self, stock_code: str, start_date: str = None, 
                                     end_date: str = None, period: str = "daily") -> dict:
         """
@@ -250,13 +337,12 @@ class StockDataService:
         """
         db = self.get_db()
         try:
-            # 默认获取最近180天的数据
             if not end_date:
                 end_date = datetime.date.today().strftime("%Y%m%d")
             if not start_date:
                 start_date = (datetime.date.today() - datetime.timedelta(days=180)).strftime("%Y%m%d")
             
-            print(f"获取 {stock_code} 历史数据: {start_date} 至 {end_date}")
+            print(f"📈 获取 {stock_code} 历史数据: {start_date} 至 {end_date}")
             
             # 调用akshare接口 - 前复权
             df = ak.stock_zh_a_hist(
@@ -264,7 +350,7 @@ class StockDataService:
                 period=period,
                 start_date=start_date,
                 end_date=end_date,
-                adjust="qfq"  # 前复权
+                adjust="qfq"
             )
             
             if df.empty:
@@ -301,6 +387,8 @@ class StockDataService:
             db.commit()
             db.close()
             
+            print(f"   ✓ 保存 {count} 条历史数据")
+            
             return {
                 "status": "success",
                 "message": f"成功获取 {stock_code} 历史数据",
@@ -311,7 +399,8 @@ class StockDataService:
             
         except Exception as e:
             db.close()
-            return {"status": "error", "message": f"获取历史数据失败: {str(e)}"}
+            print(f"   ✗ 获取失败: {str(e)}")
+            raise
     
     async def fetch_dividend_data(self, date_str: str = None) -> dict:
         """
@@ -322,7 +411,7 @@ class StockDataService:
             if not date_str:
                 date_str = datetime.date.today().strftime("%Y%m%d")
             
-            print(f"获取 {date_str} 分红数据...")
+            print(f"💰 获取 {date_str} 分红数据...")
             
             # 调用akshare接口
             df = ak.news_trade_notify_dividend_baidu(date=date_str)
@@ -357,6 +446,8 @@ class StockDataService:
             db.commit()
             db.close()
             
+            print(f"   ✓ 保存 {count} 条分红数据")
+            
             return {
                 "status": "success",
                 "message": f"成功获取 {date_str} 分红数据",
@@ -369,10 +460,7 @@ class StockDataService:
             return {"status": "error", "message": f"获取分红数据失败: {str(e)}"}
     
     async def analyze_stock(self, stock_code: str, db: Session = None) -> dict:
-        """
-        分析单只股票
-        优先使用市场数据，不足时使用历史数据和分红数据补充
-        """
+        """分析单只股票"""
         should_close = False
         if db is None:
             db = self.get_db()
@@ -381,14 +469,13 @@ class StockDataService:
         try:
             today = datetime.date.today()
             
-            # 1. 获取最新市场数据 (接口1)
+            # 1. 获取最新市场数据
             market_data = db.query(DailyMarketData).filter(
                 DailyMarketData.code == stock_code,
                 DailyMarketData.date == today
             ).first()
             
             if not market_data:
-                # 如果今天没有市场数据，尝试获取最近一次的
                 market_data = db.query(DailyMarketData).filter(
                     DailyMarketData.code == stock_code
                 ).order_by(desc(DailyMarketData.date)).first()
@@ -398,18 +485,16 @@ class StockDataService:
                     db.close()
                 return {"status": "error", "message": f"股票 {stock_code} 无市场数据"}
             
-            # 基础数据
             latest_price = market_data.latest_price
             pe_ratio = market_data.pe_dynamic
             pb_ratio = market_data.pb
             stock_name = market_data.name
             data_source = "market"
             
-            # 2. 计算波动率 (使用历史数据)
+            # 2. 计算波动率
             volatility_30d = 0
             volatility_60d = 0
             
-            # 获取最近60天的历史数据
             hist_data = db.query(HistoricalData).filter(
                 HistoricalData.stock_code == stock_code
             ).order_by(desc(HistoricalData.date)).limit(60).all()
@@ -418,12 +503,10 @@ class StockDataService:
                 closes = [h.close for h in reversed(hist_data) if h.close]
                 
                 if len(closes) >= 30:
-                    # 计算30日波动率
                     series_30 = pd.Series(closes[-30:])
                     log_ret_30 = np.log(series_30 / series_30.shift(1)).dropna()
                     volatility_30d = log_ret_30.std() * np.sqrt(252) * 100
                     
-                    # 计算60日波动率
                     if len(closes) >= 60:
                         series_60 = pd.Series(closes[-60:])
                         log_ret_60 = np.log(series_60 / series_60.shift(1)).dropna()
@@ -431,11 +514,11 @@ class StockDataService:
                     
                     data_source = "mixed"
             
-            # 如果历史数据不足，尝试获取
+            # 如果历史数据不足,尝试获取
             if volatility_30d == 0:
-                print(f"  {stock_code} 历史数据不足，尝试获取...")
+                print(f"   {stock_code} 历史数据不足，尝试获取...")
                 await self.fetch_historical_data(stock_code)
-                # 重新查询
+                
                 hist_data = db.query(HistoricalData).filter(
                     HistoricalData.stock_code == stock_code
                 ).order_by(desc(HistoricalData.date)).limit(60).all()
@@ -448,10 +531,8 @@ class StockDataService:
                         volatility_30d = log_ret_30.std() * np.sqrt(252) * 100
                         data_source = "mixed"
             
-            # 3. 计算股息率 (使用分红数据)
+            # 3. 计算股息率
             dividend_yield = 0
-            
-            # 获取最近一年的分红记录
             one_year_ago = today - datetime.timedelta(days=365)
             dividends = db.query(DividendData).filter(
                 DividendData.stock_code == stock_code,
@@ -461,23 +542,20 @@ class StockDataService:
             if dividends and latest_price:
                 total_dividend = 0
                 for div in dividends:
-                    # 解析分红金额 (格式如 "1.10元" 或 "0.08港元")
                     div_str = str(div.dividend)
                     match = re.search(r'(\d+\.?\d*)', div_str)
                     if match:
                         total_dividend += float(match.group(1))
                 
-                # 年化股息率 = (年度分红 / 股价) * 100
                 if total_dividend > 0:
                     dividend_yield = (total_dividend / latest_price) * 100
                     data_source = "mixed"
             
-            # 4. ROE和成长性 (暂时从市场数据获取，后续可扩展)
+            # 4. ROE和成长性
             roe = 0
             profit_growth = 0
             
             # 5. 评分系统
-            # 波动率评分 (0-40分): 波动率越低越好
             volatility_score = 0
             if volatility_30d > 0:
                 if volatility_30d < 20:
@@ -489,7 +567,6 @@ class StockDataService:
                 elif volatility_30d < 50:
                     volatility_score = 10
             
-            # 股息率评分 (0-30分): 股息率越高越好
             dividend_score = 0
             if dividend_yield >= 5:
                 dividend_score = 30
@@ -502,7 +579,6 @@ class StockDataService:
             elif dividend_yield >= 1:
                 dividend_score = 10
             
-            # 成长性评分 (0-30分): ROE越高越好
             growth_score = 0
             if roe > 15:
                 growth_score = 30
@@ -515,10 +591,8 @@ class StockDataService:
             elif roe > 5:
                 growth_score = 10
             
-            # 总分
             total_score = volatility_score + dividend_score + growth_score
             
-            # 建议
             if total_score >= 70:
                 suggestion = "强烈推荐"
             elif total_score >= 60:
@@ -571,12 +645,9 @@ class StockDataService:
             return {"status": "error", "message": f"分析 {stock_code} 失败: {str(e)}"}
     
     async def analyze_all_watched_stocks(self) -> dict:
-        """
-        分析所有用户关注的股票
-        """
+        """分析所有用户关注的股票"""
         db = self.get_db()
         try:
-            # 获取所有用户关注的股票(去重)
             watched_stocks = db.query(UserStockWatch.stock_code).distinct().all()
             watched_codes = [s[0] for s in watched_stocks]
             
@@ -584,22 +655,28 @@ class StockDataService:
                 db.close()
                 return {"status": "success", "message": "没有用户关注的股票", "count": 0}
             
-            print(f"开始分析 {len(watched_codes)} 只被关注的股票...")
+            print(f"\n{'='*60}")
+            print(f"📊 开始分析 {len(watched_codes)} 只被关注的股票")
+            print(f"{'='*60}\n")
             
             success_count = 0
             error_count = 0
             
-            for code in watched_codes:
+            for i, code in enumerate(watched_codes, 1):
+                print(f"[{i}/{len(watched_codes)}] 分析 {code}...")
                 result = await self.analyze_stock(code, db)
                 if result["status"] == "success":
                     success_count += 1
-                    print(f"  ✓ {code} - {result.get('suggestion', '')}")
+                    print(f"   ✓ {result.get('stock_name', code)} - 评分:{result.get('total_score', 0)} - {result.get('suggestion', '')}")
                 else:
                     error_count += 1
-                    print(f"  ✗ {code} - {result.get('message', '')}")
+                    print(f"   ✗ {result.get('message', '')}")
                 
-                # 避免请求过快
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
+            
+            print(f"\n{'='*60}")
+            print(f"✅ 分析完成: 成功 {success_count}, 失败 {error_count}")
+            print(f"{'='*60}\n")
             
             db.close()
             
@@ -617,16 +694,14 @@ class StockDataService:
 
 
 # --- FastAPI应用 ---
-app = FastAPI(title="价值分析系统", version="2.0")
+app = FastAPI(title="价值分析系统 v2.1", version="2.1")
 stock_service = StockDataService()
 
-# 定时任务调度器
 scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def startup_event():
     """启动时初始化定时任务"""
-    # 每日15:30自动获取全市场数据
     scheduler.add_job(
         stock_service.fetch_daily_market_data,
         CronTrigger(hour=15, minute=30),
@@ -634,7 +709,6 @@ async def startup_event():
         replace_existing=True
     )
     
-    # 每日16:00自动分析所有关注股票
     scheduler.add_job(
         stock_service.analyze_all_watched_stocks,
         CronTrigger(hour=16, minute=0),
@@ -643,16 +717,16 @@ async def startup_event():
     )
     
     scheduler.start()
-    print("定时任务已启动:")
-    print("  - 每日15:30获取全市场数据")
-    print("  - 每日16:00分析所有关注股票")
+    print("\n✅ 定时任务已启动:")
+    print("   - 每日15:30获取全市场数据")
+    print("   - 每日16:00分析所有关注股票\n")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """关闭时停止定时任务"""
     scheduler.shutdown()
 
-# --- 用户管理接口 ---
+# --- API接口 ---
 
 @app.post("/users/create")
 def create_user(user_id: str, username: str):
@@ -674,28 +748,20 @@ def create_user(user_id: str, username: str):
         db.close()
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 股票关注管理 ---
-
 @app.post("/watch/add")
 def add_watch_stock(user_id: str, stock_codes: str):
-    """
-    添加股票到用户关注列表
-    stock_codes: 逗号分隔的股票代码,如 "600036,000001,600519"
-    """
+    """添加股票到用户关注列表"""
     db = SessionLocal()
     try:
-        # 检查用户是否存在
         user = db.query(User).filter(User.user_id == user_id).first()
         if not user:
             db.close()
             raise HTTPException(status_code=404, detail="用户不存在")
         
-        # 提取股票代码
         codes = re.findall(r'\d{6}', stock_codes)
         added = 0
         
         for code in set(codes):
-            # 检查是否已关注
             existing = db.query(UserStockWatch).filter(
                 UserStockWatch.user_id == user_id,
                 UserStockWatch.stock_code == code
@@ -755,38 +821,23 @@ def list_watch_stocks(user_id: str):
         db.close()
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 数据获取接口 ---
-
 @app.post("/data/market/fetch")
 async def fetch_market_data(force: bool = False):
-    """
-    手动获取全市场数据
-    force: 是否强制更新今日数据
-    """
+    """手动获取全市场数据"""
     result = await stock_service.fetch_daily_market_data(force=force)
     return result
 
 @app.post("/data/history/fetch")
 async def fetch_history_data(stock_code: str, start_date: str = None, end_date: str = None):
-    """
-    手动获取指定股票的历史数据
-    stock_code: 股票代码
-    start_date: 开始日期 (格式: 20240101)
-    end_date: 结束日期 (格式: 20240131)
-    """
+    """手动获取指定股票的历史数据"""
     result = await stock_service.fetch_historical_data(stock_code, start_date, end_date)
     return result
 
 @app.post("/data/dividend/fetch")
 async def fetch_dividend_data(date_str: str = None):
-    """
-    手动获取分红数据
-    date_str: 日期 (格式: 20240101), 默认为今天
-    """
+    """手动获取分红数据"""
     result = await stock_service.fetch_dividend_data(date_str)
     return result
-
-# --- 分析接口 ---
 
 @app.post("/analyze/manual")
 async def manual_analyze(background_tasks: BackgroundTasks):
@@ -800,14 +851,11 @@ async def analyze_single_stock(stock_code: str):
     result = await stock_service.analyze_stock(stock_code)
     return result
 
-# --- 导出接口 ---
-
 @app.get("/export/global")
 def export_global_csv():
     """导出全局分析结果到CSV"""
     db = SessionLocal()
     try:
-        # 获取每只股票的最新分析结果
         subquery = db.query(
             StockAnalysisResult.stock_code,
             func.max(StockAnalysisResult.analysis_date).label('max_date')
@@ -857,7 +905,6 @@ def export_user_csv(user_id: str):
     """导出用户关注股票的分析结果到CSV"""
     db = SessionLocal()
     try:
-        # 获取用户关注的股票代码
         watched = db.query(UserStockWatch.stock_code).filter(
             UserStockWatch.user_id == user_id
         ).all()
@@ -868,7 +915,6 @@ def export_user_csv(user_id: str):
             db.close()
             raise HTTPException(status_code=404, detail="用户未关注任何股票")
         
-        # 获取这些股票的最新分析结果
         subquery = db.query(
             StockAnalysisResult.stock_code,
             func.max(StockAnalysisResult.analysis_date).label('max_date')
@@ -915,8 +961,6 @@ def export_user_csv(user_id: str):
         db.close()
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 系统状态接口 ---
-
 @app.get("/status")
 def get_status():
     """获取系统状态"""
@@ -929,16 +973,13 @@ def get_status():
         dividend_data_count = db.query(DividendData).count()
         analysis_count = db.query(StockAnalysisResult).count()
         
-        # 最新市场数据日期
         latest_market = db.query(func.max(DailyMarketData.date)).scalar()
-        
-        # 最新分析日期
         latest_analysis = db.query(func.max(StockAnalysisResult.analysis_date)).scalar()
         
         db.close()
         
         return {
-            "system": "股票价值分析系统 v2.0",
+            "system": "股票价值分析系统 v2.1 (网络优化版)",
             "users": user_count,
             "watched_stocks": watch_count,
             "market_data_records": market_data_count,
@@ -955,16 +996,22 @@ def get_status():
 
 if __name__ == "__main__":
     import uvicorn
-    print("=" * 60)
-    print("股票价值分析系统 v2.0 - 启动中...")
-    print("=" * 60)
-    print("\n核心功能:")
-    print("✓ 多用户支持")
-    print("✓ 三个数据源独立存储(市场/历史/分红)")
-    print("✓ 定时任务: 15:30获取市场数据, 16:00分析股票")
-    print("✓ 手动分析支持")
-    print("✓ 全局/用户CSV导出")
-    print("✓ 智能评分系统(波动率+股息率+成长性)")
-    print("\n访问文档: http://localhost:8000/docs")
-    print("=" * 60)
+    print("\n" + "="*60)
+    print("🚀 股票价值分析系统 v2.1 - 网络优化版")
+    print("="*60)
+    print("\n✨ 新增功能:")
+    print("  • 智能重试机制 (最多3次重试)")
+    print("  • 彻底禁用代理")
+    print("  • 批量保存优化")
+    print("  • 详细进度显示")
+    print("\n📚 核心功能:")
+    print("  ✓ 多用户支持")
+    print("  ✓ 三数据源独立存储")
+    print("  ✓ 自动定时任务 (15:30 + 16:00)")
+    print("  ✓ 智能评分系统")
+    print("\n🔗 访问:")
+    print("  API文档: http://localhost:8000/docs")
+    print("  系统状态: http://localhost:8000/status")
+    print("="*60 + "\n")
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
