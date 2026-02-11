@@ -1,4 +1,11 @@
 import os
+import socket
+# 强制让 Python 的所有网络连接只走 IPv4
+orig_getaddrinfo = socket.getaddrinfo
+def patched_getaddrinfo(*args, **kwargs):
+    res = orig_getaddrinfo(*args, **kwargs)
+    return [r for r in res if r[0] == socket.AF_INET]
+socket.getaddrinfo = patched_getaddrinfo
 import time
 from contextlib import asynccontextmanager
 import datetime
@@ -247,44 +254,67 @@ class StockDataService:
             return None
 
     async def fetch_em_data_via_web_api(self, page_size: int = 100) -> pd.DataFrame:
-        """【方案一】原生网页 API 分页请求方式"""
+        """【方案一：深度加固版】原生网页 API 分页请求方式"""
+        import random
         all_dfs = []
         current_page = 1
         total_pages = 999
         
-        url = "http://82.push2.eastmoney.com/api/qt/clist/get"
+        # 换用最新的 https 接口地址，不再使用固定 IP 节点
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        
+        # 模拟极其真实的浏览器头部
         headers = {
+            "Host": "push2.eastmoney.com",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Referer": "http://quote.eastmoney.com/center/gridlist.html"
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+            "Connection": "keep-alive"
         }
 
         print(f"\n🌐 启动原生网页 API 抓取模式 (每页 {page_size} 条)")
         
+        # 创建一个干净的 session，彻底隔离系统代理
+        session = requests.Session()
+        session.trust_env = False  # 关键：强制不读取系统环境变量代理
+        session.proxies = {"http": None, "https": None} # 再次双重保险
+
         while current_page <= total_pages:
             params = {
-                "pn": current_page, "pz": page_size,
-                "po": "1", "np": "1", "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": "2", "invt": "2", "fid": "f3",
+                "pn": current_page,
+                "pz": page_size,
+                "po": "1",
+                "np": "1",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": "2",
+                "invt": "2",
+                "fid": "f3",
                 "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
                 "fields": ",".join(self.em_fields_map.keys()),
+                "_": str(int(time.time() * 1000)) # 增加时间戳防止缓存拦截
             }
 
             try:
                 print(f"   ➤ 抓取第 {current_page}/{total_pages if total_pages != 999 else '?'} 页...")
+                
+                # 使用 to_thread 防止阻塞事件循环
                 response = await asyncio.to_thread(
-                    requests.get, 
-                    url, 
-                    params=params, 
-                    headers=headers, 
-                    timeout=20
+                    session.get, url, params=params, headers=headers, timeout=20
                 )
+                
+                # 检查状态码
+                if response.status_code != 200:
+                    print(f"   ⚠️ 服务器返回错误状态码: {response.status_code}")
+                    break
+
                 res_json = response.json()
                 
                 if not res_json or 'data' not in res_json or res_json['data'] is None:
                     print(f"   ⚠️ 第 {current_page} 页未能获取有效数据")
                     break
 
-                # 首页请求时更新总页数
                 if current_page == 1:
                     total_records = res_json['data']['total']
                     total_pages = (total_records + page_size - 1) // page_size
@@ -295,22 +325,25 @@ class StockDataService:
                 
                 if current_page >= total_pages: break
 
-                # 核心要求：随机间隔 10-50 秒
                 wait_time = random.uniform(10, 50)
-                print(f"   💤 随机等待 {wait_time:.1f} 秒以规避风控...")
+                print(f"   💤 随机等待 {wait_time:.1f} 秒...")
                 await asyncio.sleep(wait_time)
                 
                 current_page += 1
 
             except Exception as e:
-                print(f"   ❌ 第 {current_page} 页出错: {str(e)[:50]}。60秒后重试...")
-                await asyncio.sleep(60)
-                continue
+                print(f"   ❌ 第 {current_page} 页连接失败: {str(e)[:100]}")
+                # 如果连续 2 次失败，主动抛出异常让 fetch_daily_market_data 切换到 efinance
+                if current_page > 1:
+                    print("   ⚠️ 发生中断，尝试跳过本页...")
+                    current_page += 1
+                    continue
+                else:
+                    raise e # 第一页就断连，直接抛出异常去走 efinance
 
+        session.close()
         if not all_dfs: return pd.DataFrame()
-        
         final_df = pd.concat(all_dfs, ignore_index=True)
-        # 统一字段名
         final_df = final_df.rename(columns={k: v for k, v in self.em_fields_map.items()})
         return final_df
 
@@ -715,43 +748,46 @@ class StockDataService:
             roe, profit_growth = await self.fetch_stock_financials(stock_code)
             
             # --- 5. 综合评分系统 ---
+            # 假设 PE < 15 为低估，PE > 50 为高估 (实际可根据行业细化)
+            valuation_score = 0
+            if pe_ratio:
+                if pe_ratio < 10: valuation_score = 20
+                elif pe_ratio < 20: valuation_score = 15
+                elif pe_ratio < 30: valuation_score = 10
+                elif pe_ratio > 60: valuation_score = -10  # 高估减分
+                
+            # --- 核心改进：引入趋势分 (Momentum) ---
+            # 股价是否在 60 日均线上方？
+            trend_score = 0
+            hist_data = db.query(HistoricalData).filter(HistoricalData.stock_code == stock_code).order_by(desc(HistoricalData.date)).limit(60).all()
+            if len(hist_data) >= 60:
+                ma60 = sum([h.close for h in hist_data]) / 60
+                latest_close = hist_data[0].close
+                if latest_close > ma60: 
+                    trend_score = 10  # 处于上升趋势
+                else:
+                    trend_score = 0   # 处于下降通道，谨慎进入
+
+            # --- 综合评分逻辑 ---
+            # 1. 波动分 (20分)
+            v_score = 20 if volatility_30d < 30 else (10 if volatility_30d < 50 else 0)
             
-            # (A) 波动率评分 (最高 40分) - 越低分越高，代表稳健
-            volatility_score = 0
-            if volatility_30d > 0:
-                if volatility_30d < 20: volatility_score = 40
-                elif volatility_30d < 30: volatility_score = 30
-                elif volatility_30d < 40: volatility_score = 20
-                elif volatility_30d < 50: volatility_score = 10
+            # 2. 股息分 (30分)
+            d_score = 0
+            if dividend_yield > 5: d_score = 30
+            elif dividend_yield > 3: d_score = 20
             
-            # (B) 股息率评分 (最高 30分) - 现金红利能力
-            dividend_score = 0
-            if dividend_yield >= 5: dividend_score = 30
-            elif dividend_yield >= 4: dividend_score = 25
-            elif dividend_yield >= 3: dividend_score = 20
-            elif dividend_yield >= 2: dividend_score = 15
-            elif dividend_yield >= 1: dividend_score = 10
+            # 3. 质量分 (ROE + 增长) (20分)
+            q_score = (15 if roe > 12 else 5) + (5 if profit_growth > 10 else 0)
             
-            # (C) 成长性评分 (最高 30分) - ROE(20分) + 利润增长(10分)
-            growth_score = 0
+            # 4. 估值 + 趋势 (30分)
+            vt_score = valuation_score + trend_score
+
+            total_score = v_score + d_score + q_score + vt_score
             
-            # ROE 子项 (20分)
-            if roe > 15: growth_score += 20
-            elif roe > 10: growth_score += 15
-            elif roe > 5: growth_score += 10
-            elif roe > 0: growth_score += 5
-            
-            # 利润增长子项 (10分)
-            if profit_growth > 20: growth_score += 10
-            elif profit_growth > 10: growth_score += 7
-            elif profit_growth > 0: growth_score += 4
-            
-            # --- 总分计算 ---
-            total_score = volatility_score + dividend_score + growth_score
-            
-            # --- 投资建议逻辑 ---
-            if total_score >= 80:
-                suggestion = "🌟 极高价值 (财务强健+高分红+低波动)"
+            # --- 投资建议 ---
+            if total_score >= 85:
+                suggestion = "💎 完美标的 (低估+高息+趋势向上)"
             elif total_score >= 70:
                 suggestion = "强烈推荐"
             elif total_score >= 60:
