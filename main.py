@@ -487,12 +487,13 @@ class StockDataService:
                     db.bulk_save_objects(batch)
                     db.commit()
                     batch = []
-                    print(f"  已保存 {len(field_stats.get('latest_price', 0))} 条...")
+                    print(f"\n✅ 数据保存完成，共 {saved_count} 条")
             
             # 提交剩余数据
             if batch:
                 db.bulk_save_objects(batch)
                 db.commit()
+                saved_count += len(batch)
             
             # 显示保存统计
             print(f"\n✅ 数据保存完成!")
@@ -1135,4 +1136,4 @@ if __name__ == "__main__":
     print("  系统状态: http://localhost:8000/status")
     print("="*60 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
