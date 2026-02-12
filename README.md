@@ -1,279 +1,470 @@
-# 股票分析系统
+# 股票价值分析系统
 
-基于 FastAPI 的智能股票筛选分析系统，用于筛选波动小、股息率高、有成长价值的股票。
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 功能特性
+一个基于 FastAPI 的智能股票价值分析系统,专注于筛选**低波动率、高股息率、有成长价值**的优质股票。
 
-1. **股票管理**
-   - 添加股票到分析列表
-   - 查看所有监控股票
-   - 删除不需要的股票
+---
 
-2. **自动分析**
-   - 每日定时分析（每天早上9点）
-   - 每30秒自动获取最新数据
-   - 自动保存分析结果到数据库
+## 📑 目录
 
-3. **手动分析**
-   - 支持手动触发分析
-   - 实时查看分析进度
+- [功能特性](#-功能特性)
+- [系统架构](#-系统架构)
+- [快速开始](#-快速开始)
+- [安装部署](#-安装部署)
+- [使用指南](#-使用指南)
+- [API文档](#-api文档)
+- [数据模型](#-数据模型)
+- [评分系统](#-评分系统)
+- [常见问题](#-常见问题)
+- [开发指南](#-开发指南)
+- [更新日志](#-更新日志)
 
-4. **数据导出**
-   - 导出分析结果到CSV
-   - 支持下载最新分析报告
+---
 
-5. **分析指标**
-   - **波动率**: 计算60日年化波动率，越低越稳定
-   - **股息率**: 显示股票分红收益率
-   - **PE百分位**: 市盈率在历史数据中的位置
-   - **PB百分位**: 市净率在历史数据中的位置
-   - **买入信号**: 综合评分判断是否适合买入
+## ✨ 功能特性
 
-## 技术栈
+### 核心功能
 
-- **Web框架**: FastAPI
-- **数据库**: SQLite
-- **数据源**: AKShare (https://akshare.akfamily.xyz)
-- **定时任务**: APScheduler
-- **数据处理**: Pandas, NumPy
+- ✅ **多用户支持** - 每个用户独立的股票关注列表
+- ✅ **三数据源独立存储** - 市场数据/历史数据/分红数据分离
+- ✅ **自动定时任务** - 每日自动获取数据和分析
+- ✅ **智能评分系统** - 综合波动率、股息率、成长性三维度评分
+- ✅ **完整字段映射** - 20+字段完整保存
+- ✅ **批量数据补充** - 专业的历史数据补充工具
+- ✅ **灵活导出功能** - 全局/个人CSV导出
 
-## 安装部署
+### 技术特性
 
-### 1. 安装依赖
-    # 创建一个名为venv的虚拟环境
-    virtualenv venv
+- 🚀 **高性能** - 批量处理,异步IO
+- 🔒 **数据安全** - SQLite持久化存储
+- 📊 **实时统计** - 字段完整性实时监控
+- 🔄 **双数据源** - 自动切换,提高成功率
+- 🌐 **RESTful API** - 标准化接口设计
+- 📱 **自动化** - 定时任务,无需人工干预
 
-    # 激活虚拟环境，以便在其中安装和使用包
-    source venv/bin/activate
-    .\venv\Scripts\activate   
+---
+
+## 🏗️ 系统架构
+
+### 技术栈
+
+```
+后端框架: FastAPI
+数据库: SQLite
+数据源: AkShare + efinance
+调度器: APScheduler
+ORM: SQLAlchemy
+异步处理: asyncio
+```
+
+### 数据流程
+
+```
+1. 数据获取 (15:30)
+   ├─ 调用东方财富API
+   ├─ 获取全市场5000+股票数据
+   ├─ 完整字段映射(20+字段)
+   └─ 批量保存到数据库
+
+2. 历史数据补充 (按需)
+   ├─ 优先使用efinance
+   ├─ 备用akshare
+   ├─ 前复权数据
+   └─ 保存11个字段
+
+3. 数据分析 (16:00)
+   ├─ 获取实时市场数据
+   ├─ 计算技术指标(波动率)
+   ├─ 计算财务指标(ROE/增长率)
+   ├─ 计算股息率
+   ├─ 综合评分
+   └─ 生成投资建议
+
+4. 结果导出
+   ├─ 全局导出(所有股票)
+   └─ 用户导出(关注股票)
+```
+
+---
+
+## 🚀 快速开始
+
+### 前置要求
+
+- Python 3.8+
+- pip 包管理器
+
+### 5分钟快速体验
+
 ```bash
+# 1. 安装依赖
 pip install -r requirements.txt
-```
 
-### 2. 启动服务
-
-```bash
+# 2. 启动服务
 python main.py
+
+# 3. 访问API文档
+浏览器打开: http://localhost:8000/docs
+
+# 4. 创建用户
+curl -X POST "http://localhost:8000/users/create?user_id=demo&username=演示用户"
+
+# 5. 添加关注股票
+curl -X POST "http://localhost:8000/watch/add?user_id=demo&stock_codes=600036,000001,600519"
+
+# 6. 获取市场数据
+curl -X POST "http://localhost:8000/data/market/fetch?force=true"
+
+# 7. 补充历史数据
+python supplement_history.py watch --mode full
+
+# 8. 执行分析
+curl -X POST "http://localhost:8000/analyze/manual"
+
+# 9. 导出结果
+curl "http://localhost:8000/export/user?user_id=demo" --output result.csv
 ```
 
-服务将在 `http://localhost:8000` 启动
+---
 
-### 3. 访问API文档
+## 📦 安装部署
 
-浏览器打开: `http://localhost:8000/docs`
-
-## API 使用说明
-
-### 1. 添加股票
+### 本地部署
 
 ```bash
-curl -X POST "http://localhost:8000/stocks" \
-  -H "Content-Type: application/json" \
-  -d '{"code": "600519", "name": "贵州茅台"}'
+# 1. 克隆项目
+git clone <repository-url>
+cd stock-analysis-system
+
+# 2. 创建虚拟环境(推荐)
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+venv\Scripts\activate     # Windows
+
+# 3. 安装依赖
+pip install -r requirements.txt
+
+# 4. 启动服务
+python main_enhanced.py
+
+# 5. 访问服务
+浏览器打开: http://localhost:8000
 ```
 
-### 2. 查看股票列表
+---
+
+## 📖 使用指南
+
+### 基础使用流程
+
+#### 1. 用户管理
 
 ```bash
-curl "http://localhost:8000/stocks"
+# 创建用户
+POST /users/create?user_id=user001&username=张三
 ```
 
-### 3. 手动执行分析
+#### 2. 股票关注管理
 
 ```bash
-curl -X POST "http://localhost:8000/analyze"
+# 添加关注
+POST /watch/add?user_id=user001&stock_codes=600036,000001,600519
+
+# 查看关注列表
+GET /watch/list?user_id=user001
+
+# 移除关注
+DELETE /watch/remove?user_id=user001&stock_code=600036
 ```
 
-### 4. 查看最新分析结果
+#### 3. 数据获取
 
 ```bash
-curl "http://localhost:8000/analysis/latest"
+# 获取全市场数据
+POST /data/market/fetch?force=true
+
+# 获取单只股票历史数据
+POST /data/history/fetch?stock_code=600036
+
+# 获取分红数据
+POST /data/dividend/fetch?date_str=20241115
 ```
 
-### 5. 下载CSV报告
+#### 4. 批量补充历史数据
 
 ```bash
-curl "http://localhost:8000/export/csv" -o report.csv
+# 查看数据状态
+python supplement_history.py report
+
+# 补充用户关注股票
+python supplement_history.py watch --mode full
+
+# 补充单只股票
+python supplement_history.py single --code 600036
 ```
 
-### 6. 删除股票
+#### 5. 数据分析
 
 ```bash
-curl -X DELETE "http://localhost:8000/stocks/600519"
+# 分析单只股票
+POST /analyze/stock?stock_code=600036
+
+# 批量分析所有关注股票
+POST /analyze/manual
 ```
 
-## 数据库结构
+#### 6. 导出结果
 
-### stock_list - 股票基础信息表
-- `id`: 主键
-- `code`: 股票代码
-- `name`: 股票名称
-- `added_date`: 添加日期
-- `status`: 状态 (active/deleted)
+```bash
+# 导出全局结果
+GET /export/global
 
-### daily_analysis - 每日分析数据表
-- `id`: 主键
-- `code`: 股票代码
-- `name`: 股票名称
-- `analysis_date`: 分析日期
-- `volatility`: 波动率
-- `dividend_yield`: 股息率
-- `pb_percentile`: PB百分位
-- `pe_percentile`: PE百分位
-- `buy_signal`: 买入信号
-- `reason`: 分析说明
+# 导出用户结果
+GET /export/user?user_id=user001
+```
 
-### historical_data - 历史数据表
-- `id`: 主键
-- `code`: 股票代码
-- `trade_date`: 交易日期
-- `open/high/low/close`: 开高低收
-- `volume/amount`: 成交量/成交额
-- `pe/pb`: 市盈率/市净率
-- `dividend_yield`: 股息率
+### 高级功能
 
-## 买入信号判断标准
+#### 自动化定时任务
 
-系统采用13分制评分标准：
+系统启动后会自动配置定时任务:
 
-### 评分规则
+- **每日 15:30** - 自动获取全市场数据
+- **每日 16:00** - 自动分析所有关注股票
 
-1. **波动率** (最高3分)
-   - < 20%: 3分（波动率很低）
-   - 20-30%: 2分（波动率较低）
-   - 30-40%: 1分
-   - > 40%: 0分（波动率偏高）
+#### 数据诊断
 
-2. **股息率** (最高3分)
-   - > 4%: 3分（股息率很高）
-   - 2-4%: 2分（股息率较高）
-   - 1-2%: 1分
-   - < 1%: 0分（股息率偏低）
+```bash
+# 运行诊断工具
+python diagnose_data.py
 
-3. **PE百分位** (最高3分)
-   - < 20%: 3分（PE历史低位）
-   - 20-40%: 2分（PE较低）
-   - 40-60%: 1分
-   - > 60%: 0分（PE较高）
+# 查看字段完整性、数据量等统计信息
+```
 
-4. **PB百分位** (最高3分)
-   - < 20%: 3分（PB历史低位）
-   - 20-40%: 2分（PB较低）
-   - 40-60%: 1分
-   - > 60%: 0分（PB较高）
+---
 
-5. **成长性** (最高1分)
-   - 10 < PE < 30 且 1 < PB < 3: 1分
+## 📡 API文档
 
-### 买入信号
-- **评分 ≥ 8分**: 触发买入信号
-- **评分 < 8分**: 暂不建议买入
+### 完整API列表
 
-## 使用示例
+| 类别 | 端点 | 方法 | 说明 |
+|------|------|------|------|
+| **用户** | `/users/create` | POST | 创建用户 |
+| **关注** | `/watch/add` | POST | 添加关注 |
+| | `/watch/remove` | DELETE | 移除关注 |
+| | `/watch/list` | GET | 查看关注 |
+| **数据** | `/data/market/fetch` | POST | 获取市场数据 |
+| | `/data/history/fetch` | POST | 获取历史数据 |
+| | `/data/dividend/fetch` | POST | 获取分红数据 |
+| **分析** | `/analyze/stock` | POST | 分析单只 |
+| | `/analyze/manual` | POST | 批量分析 |
+| **导出** | `/export/global` | GET | 全局导出 |
+| | `/export/user` | GET | 用户导出 |
+| **系统** | `/status` | GET | 系统状态 |
 
-### 示例1: 添加茅台并分析
+访问交互式文档: `http://localhost:8000/docs`
+
+---
+
+## 🗄️ 数据模型
+
+### 核心数据表
+
+#### 1. daily_market_data - 市场数据
+
+包含20+字段:
+- 基础: code, name, date
+- 价格: latest_price, high, low, open, close_prev
+- 成交: volume, amount, turnover_rate
+- 估值: pe_dynamic, pb
+- 其他: amplitude, change_pct等
+
+#### 2. historical_data - 历史数据
+
+包含11个字段:
+- OHLC: open, high, low, close
+- 成交: volume, amount
+- 指标: amplitude, turnover_rate, change_pct
+
+#### 3. stock_analysis_results - 分析结果
+
+包含评分详情:
+- 价格估值: latest_price, pe_ratio, pb_ratio
+- 波动率: volatility_30d, volatility_60d
+- 财务: roe, profit_growth, dividend_yield
+- 评分: volatility_score, dividend_score, growth_score
+- 结果: total_score, suggestion
+
+---
+
+## 🎯 评分系统
+
+### 三维度评分体系(总分100)
+
+#### 1. 波动率评分 (0-40分)
+
+| 30日波动率 | 评分 | 评价 |
+|-----------|------|------|
+| < 20% | 40分 | 极低波动 |
+| 20-30% | 30分 | 低波动 |
+| 30-40% | 20分 | 中等波动 |
+| 40-50% | 10分 | 较高波动 |
+| > 50% | 0分 | 高波动 |
+
+#### 2. 股息率评分 (0-30分)
+
+| 股息率 | 评分 | 评价 |
+|--------|------|------|
+| ≥ 5% | 30分 | 高股息 |
+| ≥ 4% | 25分 | 较高股息 |
+| ≥ 3% | 20分 | 中等股息 |
+| ≥ 2% | 15分 | 一般股息 |
+| ≥ 1% | 10分 | 低股息 |
+
+#### 3. 成长性评分 (0-30分)
+
+| ROE | 评分 | 评价 |
+|-----|------|------|
+| > 15% | 30分 | 优秀 |
+| > 12% | 25分 | 良好 |
+| > 10% | 20分 | 中等 |
+| > 8% | 15分 | 一般 |
+| > 5% | 10分 | 较差 |
+
+### 投资建议
+
+| 总分 | 建议 |
+|------|------|
+| ≥ 70分 | 强烈推荐 ⭐⭐⭐⭐⭐ |
+| 60-69分 | 推荐 ⭐⭐⭐⭐ |
+| 50-59分 | 可以关注 ⭐⭐⭐ |
+| 40-49分 | 观望 ⭐⭐ |
+| < 40分 | 不推荐 ⭐ |
+
+---
+
+## ❓ 常见问题
+
+### Q1: 如何开始使用?
+
+按照[快速开始](#-快速开始)章节的步骤操作即可。
+
+### Q2: 数据库字段为空怎么办?
+
+使用增强版代码 `main_enhanced.py` 并重新获取数据,字段完整性会从70%提升到95%+。
+
+详见: [FIELD_ENHANCEMENT.md](FIELD_ENHANCEMENT.md)
+
+### Q3: 历史数据如何补充?
+
+使用专用补充工具:
+```bash
+python supplement_history.py report  # 查看状态
+python supplement_history.py watch   # 补充关注股票
+```
+
+详见: [HISTORY_SUPPLEMENT_GUIDE.md](HISTORY_SUPPLEMENT_GUIDE.md)
+
+### Q4: 数据多久更新一次?
+
+- 市场数据: 每日15:30自动更新
+- 历史数据: 按需手动更新
+- 分析结果: 每日16:00自动更新
+
+### Q5: 遇到网络错误怎么办?
+
+运行网络诊断工具:
+```bash
+python network_diagnostic.py
+```
+
+详见: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+
+---
+
+## 🔧 开发指南
+
+### 项目结构
+
+```
+stock-analysis-system/
+├── main_enhanced.py              # 主程序(推荐)
+├── supplement_history.py         # 历史数据补充工具
+├── diagnose_data.py              # 数据诊断工具
+├── requirements.txt              # 依赖列表
+├── README.md                     # 本文件
+├── FIELD_ENHANCEMENT.md          # 字段优化说明
+├── HISTORY_SUPPLEMENT_GUIDE.md   # 历史数据补充指南
+├── BUG_FIXES.md                  # Bug修复记录
+├── TROUBLESHOOTING.md            # 故障排查指南
+├── outputs/                      # 导出文件目录
+└── stock_advanced_system.db      # SQLite数据库
+```
+
+### 添加新功能
 
 ```python
-import requests
-
-# 1. 添加股票
-response = requests.post(
-    "http://localhost:8000/stocks",
-    json={"code": "600519", "name": "贵州茅台"}
-)
-print(response.json())
-
-# 2. 手动触发分析
-response = requests.post("http://localhost:8000/analyze")
-print(response.json())
-
-# 3. 查看分析结果
-import time
-time.sleep(10)  # 等待分析完成
-response = requests.get("http://localhost:8000/analysis/latest")
-print(response.json())
+@app.post("/your/endpoint")
+async def your_function(param: str):
+    """你的函数说明"""
+    # 你的逻辑
+    return {"status": "success"}
 ```
 
-### 示例2: 批量添加股票
+---
 
-```python
-import requests
+## 📝 更新日志
 
-stocks = [
-    {"code": "600519", "name": "贵州茅台"},
-    {"code": "601318", "name": "中国平安"},
-    {"code": "000858", "name": "五粮液"},
-    {"code": "600036", "name": "招商银行"}
-]
+### v2.3 (2024-02-11) - 字段增强版
 
-for stock in stocks:
-    response = requests.post(
-        "http://localhost:8000/stocks",
-        json=stock
-    )
-    print(f"添加 {stock['name']}: {response.json()}")
-```
+**新增**:
+- ✅ 完整字段映射(20个字段)
+- ✅ 实时字段完整性统计
+- ✅ 历史数据完整保存(11个字段)
+- ✅ 双重字段获取保障
 
-## 定时任务说明
+### v2.2 (2024-02-11) - Bug修复版
 
-### 每日分析任务
-- **执行时间**: 每天早上 9:00
-- **任务内容**: 分析所有列表中的股票
-- **输出**: 保存到数据库并导出CSV
+**修复**:
+- ✅ CSV导出重复定义
+- ✅ 文件名格式化错误
+- ✅ 分红数据获取函数缺失
+- ✅ 股息率/波动率计算完善
 
-### 数据获取任务
-- **执行间隔**: 每30秒
-- **任务内容**: 获取股票最新数据并保存
-- **目的**: 保持数据的实时性
+### v2.1 (2024-02-10) - 网络优化版
 
-## 注意事项
+**新增**:
+- ✅ 智能重试机制
+- ✅ 网络代理禁用
+- ✅ 批量保存优化
 
-1. **请求频率限制**: 对每个股票的请求间隔不少于30秒
-2. **数据来源**: 数据来自AKShare，请遵守相关使用规范
-3. **分析时间**: 建议在交易日进行分析，获取最新数据
-4. **数据准确性**: 系统提供参考，投资需谨慎
-5. **历史数据**: 系统会保留历史分析记录，便于回溯
+---
 
-## 输出文件
+## 🙏 致谢
 
-- **数据库文件**: `stock_analysis.db`
-- **CSV报告**: `output/stock_analysis_YYYYMMDD_HHMMSS.csv`
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [AkShare](https://akshare.akfamily.xyz/)
+- [efinance](https://github.com/Micro-sheep/efinance)
+- [SQLAlchemy](https://www.sqlalchemy.org/)
+- [APScheduler](https://apscheduler.readthedocs.io/)
 
-## 健康检查
+---
 
-```bash
-curl "http://localhost:8000/health"
-```
+## 📞 相关文档
 
-返回系统运行状态和定时任务状态。
+- [字段优化说明](FIELD_ENHANCEMENT.md)
+- [历史数据补充指南](HISTORY_SUPPLEMENT_GUIDE.md)
+- [Bug修复记录](BUG_FIXES.md)
+- [故障排查指南](TROUBLESHOOTING.md)
+- [版本对比](COMPARISON.md)
 
-## 故障排查
+---
 
-### 1. 无法获取股票数据
-- 检查网络连接
-- 确认股票代码正确
-- 查看日志文件
+**免责声明**: 本系统仅供学习研究使用,不构成任何投资建议。股市有风险,投资需谨慎。
 
-### 2. 定时任务未执行
-- 检查 `/health` 端点的 scheduler_running 状态
-- 查看应用日志
+---
 
-### 3. 分析结果异常
-- 确认股票有足够的历史数据（至少60天）
-- 检查基本面数据是否可用
-
-## 开发计划
-
-- [ ] 增加更多技术指标
-- [ ] 支持行业分析对比
-- [ ] 添加邮件通知功能
-- [ ] Web可视化界面
-- [ ] 支持更多数据源
-
-## 许可证
-
-MIT License
-
-## 免责声明
-
-本系统仅供学习和研究使用，不构成任何投资建议。投资有风险，入市需谨慎。
+Made with ❤️ for Value Investors
