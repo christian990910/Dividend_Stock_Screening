@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 from typing import Optional, List
-from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, desc, func, Boolean, Date
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, desc, func, Text, Boolean, Date
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from starlette.background import BackgroundTasks
 from fastapi import FastAPI, Depends, HTTPException
@@ -29,6 +29,7 @@ import random
 import efinance as ef
 import requests
 from requests.sessions import Session as RequestSession
+import email_service
 
 # ============================================================
 # 网络配置
@@ -57,99 +58,398 @@ SQLALCHEMY_DATABASE_URL = "sqlite:///./stock_advanced_system.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-
-# --- 数据模型 ---
 class User(Base):
+    """
+    用户表 - 存储系统用户信息
+    
+    用途: 管理系统用户,实现多用户隔离
+    """
     __tablename__ = "users"
-    user_id = Column(String, primary_key=True)
-    username = Column(String, unique=True)
-    created_at = Column(DateTime, default=datetime.datetime.now)
+    
+    # 系统字段
+    user_id = Column(Integer, primary_key=True, autoincrement=True, comment="用户ID - 系统自增")
+    
+    # 登录信息
+    account = Column(String, unique=True, nullable=False, comment="登录账号 - 用户名,唯一,用于登录")
+    nickname = Column(String, nullable=False, comment="用户昵称 - 显示名称")
+    password_hash = Column(String, nullable=False, comment="密码哈希 - 使用bcrypt加密存储")
+    
+    # 通知设置
+    email = Column(String, nullable=False, comment="通知邮箱 - 用于接收分析报告")
+    email_verified = Column(Boolean, default=False, comment="邮箱验证状态 - True:已验证, False:未验证")
+    enable_daily_report = Column(Boolean, default=True, comment="启用每日报告 - True:发送, False:不发送")
+    
+    # 其他信息
+    avatar_url = Column(String, comment="头像URL - 用户头像地址")
+    phone = Column(String, comment="手机号 - 可选")
+    
+    # 状态信息
+    is_active = Column(Boolean, default=True, comment="账号状态 - True:正常, False:禁用")
+    last_login_at = Column(DateTime, comment="最后登录时间")
+    
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.datetime.now, comment="注册时间")
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, comment="更新时间")
 
 class UserStockWatch(Base):
+    """
+    用户股票关注表 - 存储用户关注的股票列表
+    
+    用途: 记录每个用户关注的股票,支持个性化分析
+    """
     __tablename__ = "user_stock_watch"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String, index=True)
-    stock_code = Column(String, index=True)
-    added_at = Column(DateTime, default=datetime.datetime.now)
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID - 自增")
+    user_id = Column(String, index=True, comment="用户ID - 外键关联users表")
+    stock_code = Column(String, index=True, comment="股票代码 - 6位数字,如600036")
+    added_at = Column(DateTime, default=datetime.datetime.now, comment="添加时间 - 用户添加关注的时间")
+
+# ============================================================
+# 持仓记录表 
+# ============================================================
+
+class UserStockHolding(Base):
+    """
+    用户持仓表 - 记录用户购买的股票
+    
+    功能:
+    - 记录购买数量和价格
+    - 计算持仓成本和盈亏
+    - 支持多次买入(不同批次)
+    """
+    __tablename__ = "user_stock_holdings"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID")
+    
+    # 关联信息
+    user_id = Column(Integer, index=True, nullable=False, comment="用户ID - 外键关联users.user_id")
+    stock_code = Column(String, index=True, nullable=False, comment="股票代码 - 6位数字")
+    stock_name = Column(String, comment="股票名称 - 冗余字段,方便查询")
+    
+    # 购买信息
+    purchase_quantity = Column(Integer, nullable=False, comment="购买数量 - 股数(股)")
+    purchase_price = Column(Float, nullable=False, comment="购买单价 - 买入价格(元/股)")
+    purchase_amount = Column(Float, comment="购买金额 - 数量*单价(元)")
+    purchase_date = Column(Date, nullable=False, comment="购买日期 - 实际买入日期")
+    
+    # 成本信息
+    commission = Column(Float, default=0, comment="手续费 - 交易手续费(元)")
+    total_cost = Column(Float, comment="总成本 - 购买金额+手续费(元)")
+    cost_price = Column(Float, comment="成本价 - 总成本/数量(元/股)")
+    
+    # 当前状态
+    current_quantity = Column(Integer, comment="当前持有数量 - 可能因卖出而减少(股)")
+    current_price = Column(Float, comment="当前价格 - 最新市价(元/股,自动更新)")
+    current_value = Column(Float, comment="当前市值 - 当前数量*当前价格(元)")
+    
+    # 盈亏信息
+    profit_loss = Column(Float, comment="浮动盈亏 - 当前市值-总成本(元)")
+    profit_loss_pct = Column(Float, comment="盈亏比例 - (当前价-成本价)/成本价*100(%)")
+    
+    # 交易记录
+    trade_type = Column(String, default='buy', comment="交易类型 - buy:买入, sell:卖出, dividend:分红")
+    trade_note = Column(Text, comment="交易备注 - 用户自定义备注")
+    
+    # 状态标记
+    is_active = Column(Boolean, default=True, comment="是否持有 - True:持有中, False:已卖出")
+    
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, comment="更新时间")
+
+
+# ============================================================
+# 邮件通知记录表
+# ============================================================
+
+class EmailNotification(Base):
+    """
+    邮件通知记录表 - 记录每次发送的邮件
+    
+    功能:
+    - 跟踪邮件发送状态
+    - 记录失败原因
+    - 支持重发机制
+    """
+    __tablename__ = "email_notifications"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID")
+    
+    # 收件信息
+    user_id = Column(Integer, index=True, nullable=False, comment="用户ID")
+    recipient_email = Column(String, nullable=False, comment="收件人邮箱")
+    
+    # 邮件内容
+    email_type = Column(String, nullable=False, comment="邮件类型 - daily_report:每日报告, verify:验证邮件, alert:预警")
+    subject = Column(String, nullable=False, comment="邮件主题")
+    content = Column(Text, comment="邮件内容 - HTML格式")
+    
+    # 附件信息
+    has_attachment = Column(Boolean, default=False, comment="是否有附件")
+    attachment_path = Column(String, comment="附件路径 - CSV文件路径")
+    attachment_name = Column(String, comment="附件名称 - 显示的文件名")
+    
+    # 发送状态
+    status = Column(String, default='pending', comment="发送状态 - pending:待发送, sent:已发送, failed:失败")
+    send_time = Column(DateTime, comment="发送时间 - 实际发送时间")
+    error_message = Column(Text, comment="错误信息 - 发送失败时的错误详情")
+    retry_count = Column(Integer, default=0, comment="重试次数")
+    
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, comment="更新时间")
+
+# ============================================================
+# 市场数据表
+# ============================================================
 
 class DailyMarketData(Base):
+    """
+    每日市场数据表 - 存储全市场股票的每日实时行情
+    
+    数据源: 东方财富网API (stock_zh_a_spot_em)
+    更新频率: 每日15:30自动更新
+    用途: 获取最新价格、估值、成交等实时数据
+    """
     __tablename__ = "daily_market_data"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    date = Column(Date, index=True)
-    code = Column(String, index=True)
-    name = Column(String)
-    latest_price = Column(Float)
-    change_pct = Column(Float)
-    change_amount = Column(Float)
-    volume = Column(Float)
-    amount = Column(Float)
-    amplitude = Column(Float)
-    high = Column(Float)
-    low = Column(Float)
-    open = Column(Float)
-    close_prev = Column(Float)
-    volume_ratio = Column(Float)
-    turnover_rate = Column(Float)
-    pe_dynamic = Column(Float)
-    pb = Column(Float)
-    total_market_cap = Column(Float)
-    circulating_market_cap = Column(Float)
-    rise_speed = Column(Float)
-    change_5min = Column(Float)
-    updated_at = Column(DateTime, default=datetime.datetime.now)
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID - 自增")
+    date = Column(Date, index=True, comment="数据日期 - 交易日期")
+    code = Column(String, index=True, comment="股票代码 - 6位数字")
+    name = Column(String, comment="股票名称 - 中文简称,如'招商银行'")
+    
+    # 价格相关字段
+    latest_price = Column(Float, comment="最新价 - 当前交易价格(元)")
+    change_pct = Column(Float, comment="涨跌幅 - 相对昨收的涨跌百分比(%)")
+    change_amount = Column(Float, comment="涨跌额 - 相对昨收的涨跌金额(元)")
+    high = Column(Float, comment="最高价 - 当日最高成交价(元)")
+    low = Column(Float, comment="最低价 - 当日最低成交价(元)")
+    open = Column(Float, comment="开盘价 - 当日开盘价格(元)")
+    close_prev = Column(Float, comment="昨收价 - 前一交易日收盘价(元)")
+    
+    # 成交相关字段
+    volume = Column(Float, comment="成交量 - 当日成交股票数量(手,1手=100股)")
+    amount = Column(Float, comment="成交额 - 当日成交金额总额(元)")
+    amplitude = Column(Float, comment="振幅 - (最高-最低)/昨收*100(%)")
+    turnover_rate = Column(Float, comment="换手率 - 成交量/流通股本*100(%)")
+    volume_ratio = Column(Float, comment="量比 - 当日成交量/近5日平均成交量")
+    
+    # 估值相关字段
+    pe_dynamic = Column(Float, comment="市盈率-动态 - 股价/最近12个月每股收益")
+    pb = Column(Float, comment="市净率 - 股价/每股净资产")
+    
+    # 市值相关字段
+    total_market_cap = Column(Float, comment="总市值 - 股价*总股本(元)")
+    circulating_market_cap = Column(Float, comment="流通市值 - 股价*流通股本(元)")
+    
+    # 其他指标
+    rise_speed = Column(Float, comment="涨速 - 当前涨跌幅变化速度(%/分钟)")
+    change_5min = Column(Float, comment="5分钟涨跌 - 最近5分钟的涨跌幅(%)")
+    
+    updated_at = Column(DateTime, default=datetime.datetime.now, comment="更新时间 - 数据入库时间")
+
+
+# ============================================================
+# 历史数据表
+# ============================================================
 
 class HistoricalData(Base):
+    """
+    历史行情数据表 - 存储股票的历史K线数据
+    
+    数据源: efinance / akshare (前复权)
+    更新频率: 按需获取
+    用途: 计算技术指标(波动率、均线等)
+    数据类型: 前复权数据,已调整历史价格
+    """
     __tablename__ = "historical_data"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    stock_code = Column(String, index=True)
-    date = Column(Date, index=True)
-    open = Column(Float)
-    close = Column(Float)
-    high = Column(Float)
-    low = Column(Float)
-    volume = Column(Integer)
-    amount = Column(Float)
-    amplitude = Column(Float)
-    change_pct = Column(Float)
-    change_amount = Column(Float)
-    turnover_rate = Column(Float)
-    created_at = Column(DateTime, default=datetime.datetime.now)
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID - 自增")
+    stock_code = Column(String, index=True, comment="股票代码 - 6位数字")
+    date = Column(Date, index=True, comment="交易日期 - K线日期")
+    
+    # OHLC数据 (Open High Low Close)
+    open = Column(Float, comment="开盘价 - 当日开盘价格(元,前复权)")
+    close = Column(Float, comment="收盘价 - 当日收盘价格(元,前复权)")
+    high = Column(Float, comment="最高价 - 当日最高价格(元,前复权)")
+    low = Column(Float, comment="最低价 - 当日最低价格(元,前复权)")
+    
+    # 成交数据
+    volume = Column(Integer, comment="成交量 - 当日成交股数(股)")
+    amount = Column(Float, comment="成交额 - 当日成交金额(元)")
+    
+    # 技术指标
+    amplitude = Column(Float, comment="振幅 - (最高-最低)/昨收*100(%)")
+    change_pct = Column(Float, comment="涨跌幅 - (收盘-昨收)/昨收*100(%)")
+    change_amount = Column(Float, comment="涨跌额 - 收盘价-昨收价(元)")
+    turnover_rate = Column(Float, comment="换手率 - 成交量/流通股本*100(%)")
+    
+    created_at = Column(DateTime, default=datetime.datetime.now, comment="创建时间 - 数据入库时间")
+
+
+# ============================================================
+# 分红数据表
+# ============================================================
 
 class DividendData(Base):
+    """
+    分红派息数据表 - 存储股票的分红配股信息
+    
+    数据源: 百度股市通 (news_trade_notify_dividend_baidu)
+    更新频率: 按需获取
+    用途: 计算股息率,评估分红能力
+    """
     __tablename__ = "dividend_data"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    stock_code = Column(String, index=True)
-    stock_name = Column(String)
-    ex_dividend_date = Column(Date, index=True)
-    dividend = Column(String)
-    bonus_share = Column(String)
-    capitalization = Column(String)
-    physical = Column(String)
-    exchange = Column(String)
-    report_period = Column(String)
-    created_at = Column(DateTime, default=datetime.datetime.now)
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID - 自增")
+    stock_code = Column(String, index=True, comment="股票代码 - 6位数字")
+    stock_name = Column(String, comment="股票名称 - 中文简称")
+    ex_dividend_date = Column(Date, index=True, comment="除权除息日 - 分红生效日期")
+    
+    # 分红方案
+    dividend = Column(String, comment="现金分红 - 每10股派现金额(元),如'10派5'表示每10股派5元")
+    bonus_share = Column(String, comment="送股 - 每10股送股数量,如'10送3'表示每10股送3股")
+    capitalization = Column(String, comment="转增股本 - 每10股转增数量,如'10转5'表示每10股转增5股")
+    physical = Column(String, comment="实物分配 - 其他形式的分配")
+    
+    # 其他信息
+    exchange = Column(String, comment="交易所 - 上交所/深交所")
+    report_period = Column(String, comment="报告期 - 分红对应的财报期,如'2023年报'")
+    
+    created_at = Column(DateTime, default=datetime.datetime.now, comment="创建时间 - 数据入库时间")
+
+
+# ============================================================
+# 分析结果表
+# ============================================================
 
 class StockAnalysisResult(Base):
+    """
+    股票分析结果表 - 存储股票的综合分析评分
+    
+    生成方式: 系统自动分析计算
+    更新频率: 每日16:00自动更新
+    用途: 根据三维度评分筛选优质股票
+    评分维度: 波动率(0-40) + 股息率(0-30) + 成长性(0-30) = 总分(0-100)
+    """
     __tablename__ = "stock_analysis_results"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    stock_code = Column(String, index=True)
-    stock_name = Column(String)
-    analysis_date = Column(Date, index=True)
-    latest_price = Column(Float)
-    pe_ratio = Column(Float)
-    pb_ratio = Column(Float)
-    volatility_30d = Column(Float)
-    volatility_60d = Column(Float)
-    dividend_yield = Column(Float)
-    roe = Column(Float)
-    profit_growth = Column(Float)
-    volatility_score = Column(Integer)
-    dividend_score = Column(Integer)
-    growth_score = Column(Integer)
-    total_score = Column(Integer)
-    suggestion = Column(String)
-    data_source = Column(String)
-    created_at = Column(DateTime, default=datetime.datetime.now)
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID - 自增")
+    stock_code = Column(String, index=True, comment="股票代码 - 6位数字")
+    stock_name = Column(String, comment="股票名称 - 中文简称")
+    analysis_date = Column(Date, index=True, comment="分析日期 - 数据分析日期")
+    
+    # 基础数据
+    latest_price = Column(Float, comment="最新价 - 分析时的股票价格(元)")
+    pe_ratio = Column(Float, comment="市盈率 - 动态市盈率")
+    pb_ratio = Column(Float, comment="市净率 - 当前市净率")
+    
+    # 波动率指标
+    volatility_30d = Column(Float, comment="30日波动率 - 最近30个交易日的年化波动率(%)")
+    volatility_60d = Column(Float, comment="60日波动率 - 最近60个交易日的年化波动率(%)")
+    
+    # 财务指标
+    dividend_yield = Column(Float, comment="股息率 - 年度分红/当前股价*100(%)")
+    roe = Column(Float, comment="ROE净资产收益率 - 净利润/净资产*100(%)")
+    profit_growth = Column(Float, comment="利润增长率 - 净利润同比增长率(%)")
+    
+    # 评分详情
+    volatility_score = Column(Integer, comment="波动率评分 - 0-40分,波动越低分数越高")
+    dividend_score = Column(Integer, comment="股息率评分 - 0-30分,股息率越高分数越高")
+    growth_score = Column(Integer, comment="成长性评分 - 0-30分,ROE越高分数越高")
+    total_score = Column(Integer, comment="综合评分 - 总分0-100分")
+    
+    # 分析结果
+    suggestion = Column(String, comment="投资建议 - 强烈推荐/推荐/可以关注/观望/不推荐")
+    data_source = Column(String, comment="数据来源 - market/enhanced/mixed")
+    
+    created_at = Column(DateTime, default=datetime.datetime.now, comment="创建时间 - 分析结果生成时间")
+
+
+# ============================================================
+# 指数成分股表 (新增)
+# ============================================================
+
+class IndexConstituent(Base):
+    """
+    指数成分股表 - 存储各大指数的成分股及权重信息
+    
+    数据源: 中证指数公司/交易所官网
+    更新频率: 季度调整,每季度首月更新
+    用途: 
+    1. 跟踪指数成分股变化
+    2. 分析行业配置权重
+    3. 指数增强策略构建
+    4. 成分股轮换监控
+    
+    支持指数:
+    - 沪深300 (000300)
+    - 中证500 (000905)
+    - 上证50 (000016)
+    - 创业板指 (399006)
+    - 科创50 (000688)
+    等主要市场指数
+    """
+    __tablename__ = "index_constituents"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID - 自增")
+    
+    # 时间标识
+    date = Column(Date, index=True, comment="生效日期 - 成分股调整生效日期,用于历史追溯")
+    
+    # 指数信息
+    index_code = Column(String, index=True, comment="指数代码 - 6位数字,如'000300'表示沪深300")
+    index_name = Column(String, comment="指数名称 - 中文名称,如'沪深300'")
+    index_name_eng = Column(String, comment="指数英文名称 - 如'CSI 300'")
+    
+    # 成分股信息
+    constituent_code = Column(String, index=True, comment="成份券代码 - 6位股票代码,如'600036'")
+    constituent_name = Column(String, comment="成份券名称 - 股票中文简称,如'招商银行'")
+    constituent_name_eng = Column(String, comment="成份券英文名称 - 如'China Merchants Bank'")
+    
+    # 交易所信息
+    exchange = Column(String, comment="交易所 - 上交所/深交所,值为'SH'或'SZ'")
+    exchange_eng = Column(String, comment="交易所英文名称 - 'Shanghai Stock Exchange'或'Shenzhen Stock Exchange'")
+    
+    # 权重信息
+    weight = Column(Float, comment="权重 - 该成分股在指数中的权重百分比(%),如5.23表示占比5.23%")
+    
+    # 辅助字段
+    industry = Column(String, comment="所属行业 - 成分股所属的申万一级行业")
+    market_cap = Column(Float, comment="市值 - 成分股总市值(亿元)")
+    
+    created_at = Column(DateTime, default=datetime.datetime.now, comment="创建时间 - 数据入库时间")
+    updated_at = Column(DateTime, default=datetime.datetime.now, onupdate=datetime.datetime.now, 
+                       comment="更新时间 - 最后修改时间")
+    
+    # 状态标记
+    is_active = Column(Integer, default=1, comment="是否有效 - 1:当前成分股, 0:已调出")
+
+
+# ============================================================
+# 索引和约束说明
+# ============================================================
+
+"""
+数据库索引设计:
+
+1. 联合索引:
+   - (date, code) on daily_market_data
+   - (stock_code, date) on historical_data
+   - (date, index_code) on index_constituents
+   
+2. 单字段索引:
+   - user_id, stock_code on user_stock_watch
+   - code on daily_market_data
+   - stock_code on historical_data, dividend_data, stock_analysis_results
+   - index_code, constituent_code on index_constituents
+
+3. 唯一约束:
+   - (date, code) on daily_market_data (一天一只股票只有一条记录)
+   - (stock_code, date) on historical_data (避免重复K线)
+   - (date, index_code, constituent_code) on index_constituents (避免重复成分股)
+"""
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -814,6 +1114,50 @@ class StockDataService:
             print(f"❌ 批量分析失败: {str(e)}")
         finally:
             db.close()
+    
+#    async def send_daily_reports(self):
+#        db = self.get_db()
+#        """发送每日报告到所有用户"""
+#        email_service = EmailService()
+#        
+#        # 获取所有启用邮件的用户
+#        users = db.query(User).filter(
+#            User.enable_daily_report == True,
+#            User.email_verified == True
+#        ).all()
+#        
+#        for user in users:
+#            # 获取用户的分析结果
+#            results = get_user_analysis_results(user.user_id)
+#            
+#            # 生成CSV
+#            csv_path = ReportGenerator.generate_user_csv(
+#                user.user_id, 
+#                results
+#            )
+#            
+#            # 计算摘要
+#            summary = ReportGenerator.calculate_summary(results)
+#            
+#            # 发送邮件
+#            success, error = email_service.send_daily_report(
+#                user.email,
+#                user.nickname,
+#                csv_path,
+#                summary
+#            )
+#            
+#            # 记录发送状态
+#            notification = EmailNotification(
+#                user_id=user.user_id,
+#                recipient_email=user.email,
+#                email_type='daily_report',
+#                status='sent' if success else 'failed',
+#                error_message=error if not success else None
+#            )
+#            db.add(notification)
+#        
+#        db.commit()
 
 # --- FastAPI 应用 ---
 stock_service = StockDataService()
@@ -836,6 +1180,20 @@ async def lifespan(app: FastAPI):
         id="daily_analysis",
         replace_existing=True
     )
+
+    # 每日16:05 - 发送邮件报告 (新增)
+    # scheduler.add_job(
+    #     email_service.send_all_daily_reports,
+    #     CronTrigger(hour=18, minute=5),
+    #     id="daily_email_reports"
+    # )
+
+    # 每日20:00 - 更新持仓盈亏 (新增)
+    # scheduler.add_job(
+    #     holdings_service.update_all_holdings_profit,
+    #     CronTrigger(hour=20, minute=0),
+    #     id="update_holdings"
+    # )
 
     scheduler.start()
 
