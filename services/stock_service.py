@@ -81,10 +81,25 @@ class StockDataService:
             url = "https://quote.eastmoney.com/center/gridlist.html"
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0 Safari/537.36"}
             response = requests.get(url, headers=headers, timeout=10, verify=False, proxies={"http": None, "https": None})
-            match = re.search(r'ut:\s*"([a-z0-9]+)"', response.text)
-            if match:
-                self.target_ut = match.group(1)
-                print(f"✅ 成功刷新 ut: {self.target_ut}")
+            total_cash_div = 0.0
+            if dividends and market.latest_price:
+                for d in dividends:
+                    div_str = str(d.dividend)
+                    
+                    # 格式1: "10派5.2" ✅
+                    match = re.search(r'10派(\d+\.?\d*)', div_str)
+                    if match:
+                        total_cash_div += float(match.group(1)) / 10
+                        continue
+                    
+                    # 格式2: "派1.5" ✅
+                    match = re.search(r'派(\d+\.?\d*)', div_str)
+                    if match:
+                        total_cash_div += float(match.group(1)) / 10
+                
+                if total_cash_div > 0:
+                    div_yield = float((total_cash_div / market.latest_price) * 100)
+                    print(f"      ✓ 股息率: {div_yield:.2f}% (年度分红: {total_cash_div:.2f}元/股)")
                 return True
         except Exception as e:
             print("❌ 刷新 ut 失败:", e)
@@ -325,15 +340,45 @@ class StockDataService:
             db.close()
 
     async def fetch_financial_metrics(self, stock_code: str):
-        """核心修复：同时返回 ROE 和 利润增长率"""
+        """
+        获取财务指标 - 增强修复版
+        解决 'str' object has no attribute 'get' 报错
+        返回: (ROE, 利润增长率)
+        """
         try:
+            # 1. 尝试使用 efinance
             df = await asyncio.to_thread(ef.stock.get_base_info, stock_code)
-            if df is None or df.empty: return 0.0, 0.0
-            roe = self._safe_float(df.iloc[0].get('净资产收益率(%)', 0))
-            growth = self._safe_float(df.iloc[0].get('净利润同比(%)', 0))
-            return roe, growth
-        except: 
-            return 0.0, 0.0
+            
+            if df is not None and not df.empty:
+                # ✅ 关键修复：统一将数据转换为字典，无论它是 DataFrame 还是 Series
+                if isinstance(df, pd.DataFrame):
+                    data = df.to_dict('records')[0]
+                else:
+                    data = df.to_dict()
+                
+                # 使用 or 链式获取，只要有一个有值就行
+                roe = self._safe_float(data.get('净资产收益率(%)') or data.get('ROE(%)') or 0)
+                growth = self._safe_float(data.get('净利润同比(%)') or data.get('净利润增长率(%)') or 0)
+                
+                if roe != 0 or growth != 0:
+                    return float(roe), float(growth)
+            
+            # 2. 方法2: akshare 备用 (针对新浪财务报表接口)
+            # 注意：此接口 symbol 格式可能不同，这里尝试做简单兼容
+            df_fin = await asyncio.to_thread(ak.stock_financial_report_sina, symbol=stock_code)
+            if df_fin is not None and not df_fin.empty:
+                # 新浪接口通常 metrics 在行索引或特定列
+                # 这里转为字典并提取最上面一行（最新报表）
+                data_fin = df_fin.to_dict('records')[0]
+                roe = self._safe_float(data_fin.get('净资产收益率') or 0)
+                growth = self._safe_float(data_fin.get('净利润同比增长') or 0)
+                return float(roe), float(growth)
+                
+        except Exception as e:
+            # 记录更详细的错误但确保不中断
+            print(f"      ⚠️ {stock_code} 财务指标解析失败: {str(e)[:100]}")
+        
+        return 0.0, 0.0
 
     async def analyze_stock(self, stock_code: str, db: Session):
         """综合分析评分 - 严格映射每一个字段"""
@@ -343,29 +388,54 @@ class StockDataService:
         
         # 1. 波动率深度分析 (0-40分)
         v30, v60, vol_score = 0.0, 0.0, 0
-        hist = db.query(HistoricalData).filter(HistoricalData.stock_code == stock_code).order_by(desc(HistoricalData.date)).limit(100).all()
-        if len(hist) >= 60:
-            closes = np.array([h.close for h in reversed(hist)])
-            log_returns = np.diff(np.log(closes))
-            v30 = np.std(log_returns[-30:]) * np.sqrt(252) * 100
-            v60 = np.std(log_returns[-60:]) * np.sqrt(252) * 100
-            if v30 < 20: vol_score = 40
-            elif v30 < 30: vol_score = 30
-            elif v30 < 40: vol_score = 20
-            else: vol_score = 10
+        # 获取120条数据确保足够
+        hist = db.query(HistoricalData).filter(
+            HistoricalData.stock_code == stock_code,
+            HistoricalData.close.isnot(None)
+        ).order_by(desc(HistoricalData.date)).limit(120).all()
+
+        # 反转为正序
+        prices = [float(h.close) for h in reversed(hist)]
+        price_series = pd.Series(prices)
+        log_returns = np.log(price_series / price_series.shift(1)).dropna()
+
+        # 分别计算30日和60日
+        if len(log_returns) >= 30:
+            v30 = float(log_returns.tail(30).std() * np.sqrt(252) * 100)
+            
+        if len(log_returns) >= 60:
+            v60 = float(log_returns.tail(60).std() * np.sqrt(252) * 100)  # ✅ 修复
+        
+        if v30 < 20: vol_score = 40
+        elif v30 < 30: vol_score = 30
+        elif v30 < 40: vol_score = 20
+        else: vol_score = 10
 
         # 2. 股息率计算 (0-30分)
         div_yield, div_score = 0.0, 0
         one_year_ago = today - datetime.timedelta(days=365)
         dividends = db.query(DividendData).filter(DividendData.stock_code == stock_code, DividendData.ex_dividend_date >= one_year_ago).all()
         
-        total_div = 0
-        if dividends:
+        total_cash_div = 0.0
+        if dividends and market.latest_price:
             for d in dividends:
-                match = re.search(r'派(\d+\.?\d*)', str(d.dividend))
-                if match: total_div += float(match.group(1)) / 10
+                div_str = str(d.dividend)
+                
+                # 格式1: "10派5.2" ✅
+                match = re.search(r'10派(\d+\.?\d*)', div_str)
+                if match:
+                    total_cash_div += float(match.group(1)) / 10
+                    continue
+                
+                # 格式2: "派1.5" ✅
+                match = re.search(r'派(\d+\.?\d*)', div_str)
+                if match:
+                    total_cash_div += float(match.group(1)) / 10
             
-            div_yield = (total_div / market.latest_price * 100) if market.latest_price > 0 else 0
+            if total_cash_div > 0:
+                div_yield = float((total_cash_div / market.latest_price) * 100)
+                print(f"      ✓ 股息率: {div_yield:.2f}% (年度分红: {total_cash_div:.2f}元/股)")
+
             if div_yield >= 5: div_score = 30
             elif div_yield >= 3: div_score = 20
             elif div_yield >= 1.5: div_score = 10
@@ -373,10 +443,18 @@ class StockDataService:
         # 3. 财务与成长性 (0-30分)
         # ✅ 这里解包元组，修复 TypeError
         roe, profit_growth = await self.fetch_financial_metrics(stock_code)
+        # 成长性评分
         growth_score = 0
-        if roe > 15: growth_score = 30
-        elif roe > 10: growth_score = 20
-        elif roe > 5: growth_score = 10
+        if roe > 15:
+            growth_score = 30
+        elif roe > 12:
+            growth_score = 25
+        elif roe > 10:
+            growth_score = 20
+        elif roe > 8:
+            growth_score = 15
+        elif roe > 5:
+            growth_score = 10
 
         # 4. 汇总保存 - 映射模型中的所有字段
         res = StockAnalysisResult(
@@ -503,13 +581,14 @@ class StockDataService:
             pb_ratio=market.pb,
             
             # 波动率指标 (显式映射)
-            volatility_30d=round(v30, 2),
-            volatility_60d=round(v60, 2),
+            volatility_30d=round(v30, 2) if v30 > 0 else 0.0,
+            volatility_60d=round(v60, 2) if v60 > 0 else 0.0,
             
             # 财务指标 (显式映射)
-            dividend_yield=round(div_yield, 2),
-            roe=round(roe, 2),
-            profit_growth=round(profit_growth, 2),
+            dividend_yield=round(div_yield, 2) if div_yield > 0 else 0.0,  # ✅
+            roe=round(roe, 2) if roe > 0 else 0.0,  # ✅
+            profit_growth=round(profit_growth, 2) if profit_growth else 0.0,  # ✅
+            
             
             # 评分详情 (显式映射)
             volatility_score=int(vol_score),
