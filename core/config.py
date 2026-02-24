@@ -24,15 +24,20 @@ class Settings(BaseSettings):
     SENDER_NAME: str = "价值分析系统"
     
     # 财务数据抓取配置
-    FINANCIAL_FETCH_TIMEOUT: int = 15  # 财务数据获取超时时间(秒)
-    FINANCIAL_RETRY_COUNT: int = 3     # 财务数据重试次数
-    ENABLE_FINANCIAL_FALLBACK: bool = True  # 是否启用降级策略
+    FINANCIAL_FETCH_TIMEOUT: int = 15      # 财务数据获取超时时间(秒)
+    FINANCIAL_RETRY_COUNT: int = 3         # 财务数据重试次数
+    ENABLE_FINANCIAL_FALLBACK: bool = True # 是否启用降级策略
     MIN_VALID_FINANCIAL_DATA: float = 0.1  # 最小有效财务数据阈值
+    CACHE_ENABLED: bool = True             # 启用数据缓存
+    CACHE_TTL_SECONDS: int = 3600          # 缓存有效期(秒)
+    CONCURRENT_LIMIT: int = 3              # 最大并发数
+    QUALITY_THRESHOLD: float = 0.7         # 数据质量阈值
     
     # 抓取延迟配置
-    FETCH_DELAY_MIN: float = 5.0       # 最小抓取间隔(秒)
-    FETCH_DELAY_MAX: float = 30.0      # 最大抓取间隔(秒)
-    BATCH_SIZE: int = 5               # 批量处理大小
+    FETCH_DELAY_MIN: float = 5.0           # 最小抓取间隔(秒)
+    FETCH_DELAY_MAX: float = 30.0          # 最大抓取间隔(秒)
+    BATCH_SIZE: int = 5                    # 批量处理大小
+    PRIORITY_FIRST: bool = True            # 优先处理重要股票
 
     class Config:
         # 核心修改：使用绝对路径确保无论从哪里启动都能读到 .env

@@ -14,26 +14,31 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 
 from core.database import SessionLocal
-from core.config import settings  # 添加这行导入
+from core.config import settings  # 确保这行存在
 from models.stock import DailyMarketData, HistoricalData, DividendData, StockAnalysisResult, UserStockWatch
+from models.holdings import UserStockHolding  # 添加这行导入
 from crud.stock import save_market_data_batch, save_analysis_result
 
 class StockDataService:
     def __init__(self):
-        self.settings = settings  # 导入全局配置
+        self.settings = settings
         self.debug_mode = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
+        
+        # 添加缓存层
+        self.financial_cache = {}  # 财务数据缓存
+        self.cache_expiry = {}     # 缓存过期时间
+        self.CACHE_TTL = 3600      # 缓存有效期1小时
         
         # 请求会话配置
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.proxies = {"http": None, "https": None}
-        self.headers = {  # 添加 headers 属性定义
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1"
+            "Connection": "keep-alive"
         }
         self.session.headers.update(self.headers)
         
@@ -357,13 +362,26 @@ class StockDataService:
 
     async def fetch_financial_metrics(self, stock_code: str):
         """
-        获取财务指标 - 多源增强版
-        支持多个数据源和智能降级策略
+        获取财务指标 - 智能缓存增强版
+        支持缓存、多源、智能降级策略
         返回: (ROE, 利润增长率)
         """
+        # 检查缓存
+        cache_key = f"financial_{stock_code}"
+        current_time = time.time()
+        
+        if (cache_key in self.financial_cache and 
+            cache_key in self.cache_expiry and 
+            current_time < self.cache_expiry[cache_key]):
+            cached_data = self.financial_cache[cache_key]
+            if self.debug_mode:
+                print(f"      📦 使用缓存数据: ROE={cached_data[0]:.2f}%, Growth={cached_data[1]:.2f}%")
+            return cached_data
+        
         # 初始化默认值
         roe, growth = 0.0, 0.0
         attempts = []
+        success_source = None
         
         try:
             # 1. 尝试使用 efinance (主数据源)
@@ -404,6 +422,7 @@ class StockDataService:
                 
                 if roe != 0 or growth != 0:
                     print(f"      ✓ 通过 efinance 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    success_source = "efinance"
                     return float(roe), float(growth)
                     
         except Exception as e:
@@ -427,6 +446,7 @@ class StockDataService:
                 
                 if roe != 0 or growth != 0:
                     print(f"      ✓ 通过 akshare 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    success_source = "akshare_financial"
                     return float(roe), float(growth)
                     
         except Exception as e:
@@ -449,6 +469,7 @@ class StockDataService:
                 
                 if roe != 0 or growth != 0:
                     print(f"      ✓ 通过 akshare indicator 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    success_source = "akshare_indicator"
                     return float(roe), float(growth)
                     
         except Exception as e:
@@ -465,9 +486,20 @@ class StockDataService:
         except Exception as e:
             print(f"      ⚠️ 市场数据推算失败: {str(e)[:50]}")
         
+        # 数据质量评估和缓存
+        data_quality = self._assess_data_quality(roe, growth, success_source)
+        
+        if data_quality >= 0.7:  # 高质量数据才缓存
+            self.financial_cache[cache_key] = (float(roe), float(growth))
+            self.cache_expiry[cache_key] = current_time + self.CACHE_TTL
+            if self.debug_mode:
+                print(f"      💾 缓存高质量数据 (质量: {data_quality:.2f})")
+        
         # 所有方法都失败，记录详细信息
-        print(f"      ❌ {stock_code} 财务指标获取完全失败 (尝试了: {', '.join(attempts)})")
-        return 0.0, 0.0
+        if roe == 0 and growth == 0:
+            print(f"      ❌ {stock_code} 财务指标获取完全失败 (尝试了: {', '.join(attempts)})")
+        
+        return float(roe), float(growth)
     
     def _format_stock_code_for_akshare(self, stock_code: str) -> str:
         """格式化股票代码以适配 akshare 接口"""
@@ -508,6 +540,33 @@ class StockDataService:
             return 0.0, 0.0
         finally:
             db.close()
+
+    def _assess_data_quality(self, roe: float, growth: float, source: str) -> float:
+        """评估数据质量 (0-1)"""
+        quality = 0.0
+        
+        # 来源权重
+        source_weights = {
+            "efinance": 1.0,
+            "akshare_financial": 0.8,
+            "akshare_indicator": 0.6,
+            "market_derived": 0.3
+        }
+        quality += source_weights.get(source, 0.1)
+        
+        # 数值合理性检查
+        if -50 <= roe <= 50:  # ROE合理范围
+            quality += 0.3
+        if -100 <= growth <= 200:  # 增长率合理范围
+            quality += 0.3
+            
+        # 非零值加分
+        if roe != 0:
+            quality += 0.2
+        if growth != 0:
+            quality += 0.2
+            
+        return min(1.0, quality)
 
     async def analyze_stock(self, stock_code: str, db: Session):
         """综合分析评分 - 严格映射每一个字段"""
@@ -739,49 +798,67 @@ class StockDataService:
             return None
 
     async def analyze_all_watched_stocks(self):
-        """主分析任务循环 - 增强版"""
+        """主分析任务循环 - 智能增量更新版"""
         db = SessionLocal()
         stats = {"success": 0, "failed": 0, "financial_failed": 0}
+        semaphore = asyncio.Semaphore(self.settings.CONCURRENT_LIMIT)  # 从配置读取并发数
+        
         try:
             watched = db.query(UserStockWatch.stock_code).distinct().all()
             total = len(watched)
-            print(f"🚀 启动深度分析 (共 {total} 只)...")
-            print(f"📊 配置: 超时{self.settings.FINANCIAL_FETCH_TIMEOUT}s, 重试{self.settings.FINANCIAL_RETRY_COUNT}次")
             
-            for i, row in enumerate(watched, 1):
-                code = row[0]
-                try:
-                    # 数据预处理
-                    await self.fetch_historical_data(code)
-                    await self.fetch_stock_dividend_history(code)
-                    
-                    # 核心分析
-                    score = await self.analyze_stock(code, db)
-                    
-                    if score is not None:
-                        stats["success"] += 1
-                        print(f"   ✓ {i}/{total} {code} 分析完成 (评分: {score})")
-                    else:
-                        stats["failed"] += 1
-                        print(f"   ❌ {i}/{total} {code} 分析失败")
+            # 智能增量更新检查
+            update_needed = await self._check_update_needed(db, watched)
+            if not update_needed:
+                print("💡 数据已是最新，跳过更新")
+                return
+            
+            print(f"🚀 启动深度分析 (共 {total} 只)...")
+            print(f"📊 配置: 并发数{self.settings.CONCURRENT_LIMIT}, 超时{self.settings.FINANCIAL_FETCH_TIMEOUT}s")
+            
+            # 优先处理重要股票
+            priority_stocks = await self._get_priority_stocks(db, watched)
+            tasks = []
+            
+            async def process_stock(i, stock_code):
+                async with semaphore:  # 控制并发
+                    try:
+                        await self.fetch_historical_data(stock_code)
+                        await self.fetch_stock_dividend_history(stock_code)
+                        score = await self.analyze_stock(stock_code, db)
                         
-                except Exception as e:
-                    stats["failed"] += 1
-                    print(f"   ❌ {i}/{total} {code} 处理异常: {str(e)[:50]}")
+                        if score is not None:
+                            stats["success"] += 1
+                            print(f"   ✓ {i}/{total} {stock_code} 分析完成 (评分: {score})")
+                        else:
+                            stats["failed"] += 1
+                            print(f"   ❌ {i}/{total} {stock_code} 分析失败")
+                            
+                    except Exception as e:
+                        stats["failed"] += 1
+                        print(f"   ❌ {i}/{total} {stock_code} 处理异常: {str(e)[:50]}")
+                    
+                    # 智能延迟
+                    delay = random.uniform(
+                        self.settings.FETCH_DELAY_MIN, 
+                        self.settings.FETCH_DELAY_MAX
+                    )
+                    if self.debug_mode:
+                        print(f"   💤 等待 {delay:.1f} 秒...")
+                    await asyncio.sleep(delay)
+            
+            # 先处理高优先级股票
+            print(f"🎯 优先处理 {len(priority_stocks)} 只重要股票...")
+            for i, code in enumerate(priority_stocks, 1):
+                tasks.append(process_stock(i, code))
+            
+            # 再处理其他股票
+            remaining_stocks = [row[0] for row in watched if row[0] not in priority_stocks]
+            print(f"📋 处理剩余 {len(remaining_stocks)} 只股票...")
+            for i, code in enumerate(remaining_stocks, len(priority_stocks) + 1):
+                tasks.append(process_stock(i, code))
                 
-                # 智能延迟 - 根据成功率调整
-                delay = random.uniform(
-                    self.settings.FETCH_DELAY_MIN, 
-                    self.settings.FETCH_DELAY_MAX
-                )
-                print(f"   💤 随机等待 {delay:.1f} 秒...")
-                await asyncio.sleep(delay)
-                
-                # 批量处理进度报告
-                if i % self.settings.BATCH_SIZE == 0:
-                    success_rate = (stats["success"] / i) * 100
-                    print(f"\n📈 批量进度: {i}/{total} ({success_rate:.1f}% 成功率)")
-                    print(f"   成功: {stats['success']}, 失败: {stats['failed']}")
+            await asyncio.gather(*tasks, return_exceptions=True)
             
             # 最终统计
             final_success_rate = (stats["success"] / total) * 100 if total > 0 else 0
@@ -795,5 +872,48 @@ class StockDataService:
             print(f"🚨 分析过程中发生严重错误: {e}")
         finally:
             db.close()
+    
+    async def _check_update_needed(self, db: Session, watched_stocks):
+        """检查是否需要更新"""
+        # 检查最新分析日期
+        latest_analysis = db.query(StockAnalysisResult).order_by(
+            desc(StockAnalysisResult.analysis_date)
+        ).first()
+        
+        if not latest_analysis:
+            return True
+            
+        # 如果今天已经分析过，且股票数量没变，则不需要更新
+        today_count = db.query(StockAnalysisResult).filter(
+            StockAnalysisResult.analysis_date == datetime.date.today()
+        ).count()
+        
+        # 检查是否所有关注的股票都有今天的分析结果
+        watched_codes = set([row[0] for row in watched_stocks])
+        today_analyzed_codes = set([
+            result.stock_code for result in 
+            db.query(StockAnalysisResult.stock_code).filter(
+                StockAnalysisResult.analysis_date == datetime.date.today()
+            ).all()
+        ])
+        
+        return not watched_codes.issubset(today_analyzed_codes)
+    
+    async def _get_priority_stocks(self, db: Session, all_stocks):
+        """获取高优先级股票（持仓或高评分）"""
+        # 获取持仓股票
+        holdings = db.query(UserStockHolding.stock_code).filter(
+            UserStockHolding.is_active == True
+        ).distinct().all()
+        
+        # 获取高评分股票（上次评分>80）
+        high_score = db.query(StockAnalysisResult.stock_code).filter(
+            StockAnalysisResult.total_score > 80
+        ).distinct().all()
+        
+        priority_set = set([h[0] for h in holdings] + [s[0] for s in high_score])
+        all_codes = set([row[0] for row in all_stocks])
+        
+        return list(priority_set.intersection(all_codes))
 
 stock_service = StockDataService()
