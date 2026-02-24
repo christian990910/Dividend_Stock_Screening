@@ -1,3 +1,4 @@
 *.pyc
 venv/
 stock_advanced_system.db
+.env
