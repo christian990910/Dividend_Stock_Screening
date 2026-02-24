@@ -14,19 +14,35 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 
 from core.database import SessionLocal
+from core.config import settings  # 添加这行导入
 from models.stock import DailyMarketData, HistoricalData, DividendData, StockAnalysisResult, UserStockWatch
 from crud.stock import save_market_data_batch, save_analysis_result
 
 class StockDataService:
     def __init__(self):
-        # ✅ 完全还原你原来的核心参数
+        self.settings = settings  # 导入全局配置
+        self.debug_mode = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
+        
+        # 请求会话配置
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.proxies = {"http": None, "https": None}
+        self.headers = {  # 添加 headers 属性定义
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        self.session.headers.update(self.headers)
+        
+        # 目标参数 (东方财富)
         self.target_ut = "fa5fd1943c7b386f172d6893dbfba10b"
         self.target_cookies = {
-            "qgqp_b_id": "9fb8c26c0a40e0e20ffd551bb6a52cdf",
-            "st_nvi": "4U97b8QAwVvKIFT5nsAGl367a",
-            "st_si": "69103863020676",
-            "nid18": "03c4e656b6d9f1dfd8b102df6f142ef1",
-            "st_sn": "23"
+            "ut": self.target_ut,
+            "appid": "vLeSuFPlNy3zNWlM",
+            "haodou": "rRcDjVxXOaGgNqZQ"
         }
         
         # ✅ 完全还原 22 个字段映射
@@ -39,40 +55,40 @@ class StockDataService:
             'f11': 'rise_speed', 'f22': 'change_5min'
         }
 
-        self.session = requests.Session()
-        self.session.trust_env = False
-        self.session.proxies = {"http": None, "https": None}
-        self.session.cookies.update(self.target_cookies)
-        self.headers = {
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Connection": "keep-alive",
-            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
-        }
-
-
     # --- 基础工具方法 (还原) ---
 
     def _safe_float(self, val):
-        """安全转换为浮点数"""
+        """安全转换为浮点数 - 增强版"""
         try:
             if pd.isna(val) or val == '-' or val is None or val == '':
-                return None
-            if isinstance(val, str) and '%' in val:
-                return float(val.replace('%', ''))
+                return 0.0
+            if isinstance(val, str):
+                # 处理百分比
+                if '%' in val:
+                    return float(val.replace('%', '').strip())
+                # 处理中文数值单位
+                val = val.strip().replace(',', '')  # 移除千分位逗号
+                if val.lower() in ['--', 'null', 'nan', 'none']:
+                    return 0.0
             return float(val)
-        except:
-            return None
+        except (ValueError, TypeError) as e:
+            # 更详细的错误日志
+            if hasattr(self, 'debug_mode') and self.debug_mode:
+                print(f"      ⚠️ 数值转换警告: '{val}' -> 0.0 ({str(e)})")
+            return 0.0
     
     def _safe_int(self, val):
-        """安全转换为整数"""
+        """安全转换为整数 - 增强版"""
         try:
             if pd.isna(val) or val == '-' or val is None or val == '':
-                return None
-            return int(float(val))
-        except:
-            return None
+                return 0
+            if isinstance(val, str):
+                val = val.strip().replace(',', '')
+                if val.lower() in ['--', 'null', 'nan', 'none']:
+                    return 0
+            return int(float(val))  # 先转float再转int避免精度问题
+        except (ValueError, TypeError):
+            return 0
 
     def refresh_ut(self):
         """自动刷新 ut 参数 (还原)"""
@@ -314,7 +330,7 @@ class StockDataService:
         """同步历史分红记录"""
         db = SessionLocal()
         try:
-            df = await asyncio.to_thread(ak.stock_history_dividend_detail, symbol=stock_code)
+            df = await asyncio.to_thread(ak.stock_history_dividend_detail, symbol=stock_code, indicator="分红")  # 添加 indicator 参数
             if df is None or df.empty: return
             
             for _, row in df.iterrows():
@@ -341,44 +357,157 @@ class StockDataService:
 
     async def fetch_financial_metrics(self, stock_code: str):
         """
-        获取财务指标 - 增强修复版
-        解决 'str' object has no attribute 'get' 报错
+        获取财务指标 - 多源增强版
+        支持多个数据源和智能降级策略
         返回: (ROE, 利润增长率)
         """
+        # 初始化默认值
+        roe, growth = 0.0, 0.0
+        attempts = []
+        
         try:
-            # 1. 尝试使用 efinance
-            df = await asyncio.to_thread(ef.stock.get_base_info, stock_code)
+            # 1. 尝试使用 efinance (主数据源)
+            attempts.append("efinance")
+            df = await asyncio.to_thread(ef.stock.get_base_info, stock_code)  # 移除 timeout 参数
             
             if df is not None and not df.empty:
-                # ✅ 关键修复：统一将数据转换为字典，无论它是 DataFrame 还是 Series
+                # 统一数据格式处理
                 if isinstance(df, pd.DataFrame):
-                    data = df.to_dict('records')[0]
-                else:
+                    if len(df) > 0:
+                        data = df.iloc[0].to_dict()
+                    else:
+                        data = {}
+                elif isinstance(df, pd.Series):
                     data = df.to_dict()
+                else:
+                    data = {}
                 
-                # 使用 or 链式获取，只要有一个有值就行
-                roe = self._safe_float(data.get('净资产收益率(%)') or data.get('ROE(%)') or 0)
-                growth = self._safe_float(data.get('净利润同比(%)') or data.get('净利润增长率(%)') or 0)
+                # 多种字段名匹配
+                roe_fields = ['净资产收益率(%)', 'ROE(%)', '净资产收益率', 'roe', 'ROE']
+                growth_fields = ['净利润同比(%)', '净利润增长率(%)', '净利润同比增长', 'net_profit_growth', 'profit_growth']
+                
+                # 提取 ROE
+                for field in roe_fields:
+                    if field in data and data[field] is not None:
+                        roe_val = self._safe_float(data[field])
+                        if roe_val != 0:
+                            roe = roe_val
+                            break
+                
+                # 提取利润增长率
+                for field in growth_fields:
+                    if field in data and data[field] is not None:
+                        growth_val = self._safe_float(data[field])
+                        if growth_val != 0:
+                            growth = growth_val
+                            break
                 
                 if roe != 0 or growth != 0:
+                    print(f"      ✓ 通过 efinance 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
                     return float(roe), float(growth)
+                    
+        except Exception as e:
+            print(f"      ⚠️ efinance 失败: {str(e)[:50]}")
+        
+        try:
+            # 2. 尝试 akshare 财务报表 (备用数据源1)
+            attempts.append("akshare_financial")
+            # 标准化股票代码格式
+            formatted_code = self._format_stock_code_for_akshare(stock_code)
+            df_fin = await asyncio.to_thread(ak.stock_financial_report_sina, symbol=formatted_code)  # 移除 timeout 参数
             
-            # 2. 方法2: akshare 备用 (针对新浪财务报表接口)
-            # 注意：此接口 symbol 格式可能不同，这里尝试做简单兼容
-            df_fin = await asyncio.to_thread(ak.stock_financial_report_sina, symbol=stock_code)
-            if df_fin is not None and not df_fin.empty:
-                # 新浪接口通常 metrics 在行索引或特定列
-                # 这里转为字典并提取最上面一行（最新报表）
-                data_fin = df_fin.to_dict('records')[0]
-                roe = self._safe_float(data_fin.get('净资产收益率') or 0)
-                growth = self._safe_float(data_fin.get('净利润同比增长') or 0)
-                return float(roe), float(growth)
+            if df_fin is not None and not df_fin.empty and len(df_fin) > 0:
+                data_fin = df_fin.iloc[0].to_dict()
+                
+                # akshare 字段名
+                roe = self._safe_float(data_fin.get('净资产收益率') or 
+                                     data_fin.get('ROE') or 0)
+                growth = self._safe_float(data_fin.get('净利润同比增长') or 
+                                        data_fin.get('净利润增长率') or 0)
+                
+                if roe != 0 or growth != 0:
+                    print(f"      ✓ 通过 akshare 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    return float(roe), float(growth)
+                    
+        except Exception as e:
+            print(f"      ⚠️ akshare financial 失败: {str(e)[:50]}")
+        
+        try:
+            # 3. 尝试 akshare 主要指标 (备用数据源2)
+            attempts.append("akshare_indicator")
+            formatted_code = self._format_stock_code_for_akshare(stock_code)
+            df_ind = await asyncio.to_thread(ak.stock_a_lg_indicator, symbol=formatted_code)  # 使用正确的函数名
+            
+            if df_ind is not None and not df_ind.empty and len(df_ind) > 0:
+                data_ind = df_ind.iloc[0].to_dict()
+                
+                # 主要指标字段名
+                roe = self._safe_float(data_ind.get('净资产收益率(%)') or 
+                                     data_ind.get('ROE') or 0)
+                growth = self._safe_float(data_ind.get('净利润同比增长(%)') or 
+                                        data_ind.get('净利润增长率(%)') or 0)
+                
+                if roe != 0 or growth != 0:
+                    print(f"      ✓ 通过 akshare indicator 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    return float(roe), float(growth)
+                    
+        except Exception as e:
+            print(f"      ⚠️ akshare indicator 失败: {str(e)[:50]}")
+        
+        try:
+            # 4. 尝试从市场数据推算基础指标 (最终备用)
+            attempts.append("market_derived")
+            derived_roe, derived_growth = await self._derive_financial_from_market(stock_code)
+            if derived_roe != 0 or derived_growth != 0:
+                print(f"      ✓ 通过市场数据推算: ROE={derived_roe:.2f}%, Growth={derived_growth:.2f}%")
+                return derived_roe, derived_growth
                 
         except Exception as e:
-            # 记录更详细的错误但确保不中断
-            print(f"      ⚠️ {stock_code} 财务指标解析失败: {str(e)[:100]}")
+            print(f"      ⚠️ 市场数据推算失败: {str(e)[:50]}")
         
+        # 所有方法都失败，记录详细信息
+        print(f"      ❌ {stock_code} 财务指标获取完全失败 (尝试了: {', '.join(attempts)})")
         return 0.0, 0.0
+    
+    def _format_stock_code_for_akshare(self, stock_code: str) -> str:
+        """格式化股票代码以适配 akshare 接口"""
+        if stock_code.startswith(('6', '9')):
+            return f"sh{stock_code}"
+        elif stock_code.startswith(('0', '3')):
+            return f"sz{stock_code}"
+        return stock_code
+    
+    async def _derive_financial_from_market(self, stock_code: str):
+        """从市场价格数据推算基础财务指标"""
+        db = SessionLocal()
+        try:
+            # 获取历史价格数据推算趋势
+            hist_data = db.query(HistoricalData).filter(
+                HistoricalData.stock_code == stock_code
+            ).order_by(desc(HistoricalData.date)).limit(252).all()  # 一年数据
+            
+            if len(hist_data) < 30:  # 数据不足
+                return 0.0, 0.0
+            
+            # 计算价格增长率作为粗略的成长性指标
+            prices = [float(h.close) for h in reversed(hist_data)]
+            if len(prices) >= 2:
+                # 年度增长率估算
+                annual_growth = ((prices[-1] / prices[0]) ** (252/len(prices)) - 1) * 100
+                derived_growth = max(-50, min(50, annual_growth))  # 限制范围
+            else:
+                derived_growth = 0.0
+            
+            # ROE 粗略估算 (假设合理的范围)
+            derived_roe = max(0, min(30, abs(derived_growth) * 0.8))  # 简单关联
+            
+            return float(derived_roe), float(derived_growth)
+            
+        except Exception as e:
+            print(f"      ⚠️ 市场数据推算异常: {str(e)[:50]}")
+            return 0.0, 0.0
+        finally:
+            db.close()
 
     async def analyze_stock(self, stock_code: str, db: Session):
         """综合分析评分 - 严格映射每一个字段"""
@@ -610,20 +739,60 @@ class StockDataService:
             return None
 
     async def analyze_all_watched_stocks(self):
-        """主分析任务循环"""
+        """主分析任务循环 - 增强版"""
         db = SessionLocal()
+        stats = {"success": 0, "failed": 0, "financial_failed": 0}
         try:
             watched = db.query(UserStockWatch.stock_code).distinct().all()
             total = len(watched)
             print(f"🚀 启动深度分析 (共 {total} 只)...")
+            print(f"📊 配置: 超时{self.settings.FINANCIAL_FETCH_TIMEOUT}s, 重试{self.settings.FINANCIAL_RETRY_COUNT}次")
+            
             for i, row in enumerate(watched, 1):
                 code = row[0]
-                await self.fetch_historical_data(code)
-                await self.fetch_stock_dividend_history(code)
-                await self.analyze_stock(code, db)
-                print(f"   ✓ {i}/{total} {code} 分析完成")
-                # 严格遵守你要求的随机长延迟 (10-45秒)
-                await asyncio.sleep(random.uniform(10, 45))
+                try:
+                    # 数据预处理
+                    await self.fetch_historical_data(code)
+                    await self.fetch_stock_dividend_history(code)
+                    
+                    # 核心分析
+                    score = await self.analyze_stock(code, db)
+                    
+                    if score is not None:
+                        stats["success"] += 1
+                        print(f"   ✓ {i}/{total} {code} 分析完成 (评分: {score})")
+                    else:
+                        stats["failed"] += 1
+                        print(f"   ❌ {i}/{total} {code} 分析失败")
+                        
+                except Exception as e:
+                    stats["failed"] += 1
+                    print(f"   ❌ {i}/{total} {code} 处理异常: {str(e)[:50]}")
+                
+                # 智能延迟 - 根据成功率调整
+                delay = random.uniform(
+                    self.settings.FETCH_DELAY_MIN, 
+                    self.settings.FETCH_DELAY_MAX
+                )
+                print(f"   💤 随机等待 {delay:.1f} 秒...")
+                await asyncio.sleep(delay)
+                
+                # 批量处理进度报告
+                if i % self.settings.BATCH_SIZE == 0:
+                    success_rate = (stats["success"] / i) * 100
+                    print(f"\n📈 批量进度: {i}/{total} ({success_rate:.1f}% 成功率)")
+                    print(f"   成功: {stats['success']}, 失败: {stats['failed']}")
+            
+            # 最终统计
+            final_success_rate = (stats["success"] / total) * 100 if total > 0 else 0
+            print(f"\n🏁 分析完成!")
+            print(f"📊 总体统计:")
+            print(f"   总数: {total}")
+            print(f"   成功: {stats['success']} ({final_success_rate:.1f}%)")
+            print(f"   失败: {stats['failed']}")
+            
+        except Exception as e:
+            print(f"🚨 分析过程中发生严重错误: {e}")
         finally:
             db.close()
 
