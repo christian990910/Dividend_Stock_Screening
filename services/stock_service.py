@@ -29,39 +29,82 @@ class StockDataService:
         self.cache_expiry = {}     # 缓存过期时间
         self.CACHE_TTL = 3600      # 缓存有效期1小时
         
-        # 请求会话配置
+        # 优化请求会话配置
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.proxies = {"http": None, "https": None}
+        
+        # 增强连接池配置
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        # 配置重试策略
+        retry_strategy = Retry(
+            total=3,  # 总重试次数
+            backoff_factor=1,  # 退避因子
+            status_forcelist=[429, 500, 502, 503, 504],  # 需要重试的状态码
+            allowed_methods=["HEAD", "GET", "OPTIONS"]  # 允许重试的方法
+        )
+        
+        adapter = HTTPAdapter(
+            pool_connections=10,  # 连接池大小
+            pool_maxsize=20,      # 最大连接数
+            max_retries=retry_strategy
+        )
+        
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # 设置请求头
         self.headers = {
-            # 使用你URL中暗示的移动设备User-Agent
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
-            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-            "X-Requested-With": "XMLHttpRequest"  # AJAX请求标识
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Cache-Control": "max-age=0"
         }
         self.session.headers.update(self.headers)
         
-        # 目标参数 (东方财富) - 使用你提供的参数
-        self.target_ut = "bd1d9ddb04089700cf9c27f6f7426281"  # 你提供的ut值
+        # 目标参数 (东方财富)
+        self.target_ut = "bd1d9ddb04089700cf9c27f6f7426281"
         self.target_cookies = {
             "ut": self.target_ut,
-            # 可以添加更多cookie如果需要
-        }
-        
-        # API字段映射 - 匹配你提供的fields参数
-        self.em_fields_map = {
-            "f12": "code", "f14": "name", "f2": "latest_price", 
-            "f3": "change_pct", "f4": "change_amount", "f15": "high",
-            "f16": "low", "f17": "open", "f18": "prev_close",
-            "f5": "volume", "f6": "amount", "f20": "pe_dynamic",
-            "f23": "pb", "f115": "market_cap", "f116": "circulating_market_cap"
         }
 
-    # --- 基础工具方法 (还原) ---
+        self._check_akshare_interfaces()
+
+    def _check_akshare_interfaces(self):
+        """检查akshare可用接口"""
+        if self.debug_mode:
+            print("🔍 检查akshare接口可用性...")
+        
+        # 测试常用接口
+        interfaces_to_check = [
+            'stock_financial_abstract_ths',
+            'stock_financial_report_sina', 
+            'stock_a_indicator_lg',
+            'stock_a_lg_indicator',
+            'stock_individual_info'
+        ]
+        
+        available_interfaces = []
+        for interface in interfaces_to_check:
+            if hasattr(ak, interface):
+                available_interfaces.append(interface)
+                if self.debug_mode:
+                    print(f"   ✓ {interface}")
+            else:
+                if self.debug_mode:
+                    print(f"   ✗ {interface}")
+        
+        self.available_akshare_interfaces = available_interfaces
+        if self.debug_mode:
+            print(f"✅ 可用接口: {len(available_interfaces)}个")
 
     def _safe_float(self, val):
         """安全转换为浮点数 - 增强版"""
@@ -318,7 +361,7 @@ class StockDataService:
         return None
     
     async def fetch_historical_data(self, stock_code: str):
-        """同步历史K线 - 优化版"""
+        """同步历史K线 - 增强版(网络稳定性优化)"""
         # 首先检查本地数据
         db = SessionLocal()
         try:
@@ -328,21 +371,11 @@ class StockDataService:
             
             # 优化：如果已有足够数据（比如100条以上），就不重复获取
             if existing_count >= 100:
-                print(f"      ℹ️ 已有{existing_count}条K线数据，跳过获取")
+                if self.debug_mode:
+                    print(f"      ℹ️ 已有{existing_count}条K线数据，跳过获取")
                 return True
         finally:
             db.close()
-        
-        # 设置完整的请求头
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-            "X-Requested-With": "XMLHttpRequest"
-        }
         
         try:
             market = "1" if stock_code.startswith(('6', '9', '11')) else "0"
@@ -354,16 +387,15 @@ class StockDataService:
                 "fields1": "f1,f2,f3,f4,f5,f6",
                 "fields2": "f51,f52,f53,f54,f55,f56",
                 "klt": "101", "fqt": "1", "beg": "0", "end": "20500101", 
-                "lmt": "120", "_": str(int(time.time() * 1000))  # 限制获取120条数据
+                "lmt": "120", "_": str(int(time.time() * 1000))
             }
             
-            # 使用带有完整请求头的会话
+            # 使用增强的会话和重试机制
             response = await asyncio.to_thread(
-                self.session.get, url, params=params,
-                headers=headers, timeout=20, verify=False
+                self._robust_request, url, params, timeout=20
             )
             
-            if response.status_code == 200:
+            if response and response.status_code == 200:
                 match = re.search(r'\(({.*})\)', response.text)
                 if match:
                     res = json.loads(match.group(1))
@@ -373,26 +405,91 @@ class StockDataService:
                         try:
                             # 只保留最新的120条数据，避免数据膨胀
                             db.query(HistoricalData).filter(HistoricalData.stock_code == stock_code).delete()
+                            saved_count = 0
                             for line in klines:
                                 cols = line.split(',')
-                                h = HistoricalData(
-                                    stock_code=stock_code,
-                                    date=datetime.datetime.strptime(cols[0], "%Y-%m-%d").date(),
-                                    open=self._safe_float(cols[1]), close=self._safe_float(cols[2]),
-                                    high=self._safe_float(cols[3]), low=self._safe_float(cols[4])
-                                )
-                                db.add(h)
+                                if len(cols) >= 5:  # 确保数据完整
+                                    h = HistoricalData(
+                                        stock_code=stock_code,
+                                        date=datetime.datetime.strptime(cols[0], "%Y-%m-%d").date(),
+                                        open=self._safe_float(cols[1]), 
+                                        close=self._safe_float(cols[2]),
+                                        high=self._safe_float(cols[3]), 
+                                        low=self._safe_float(cols[4])
+                                    )
+                                    db.add(h)
+                                    saved_count += 1
                             db.commit()
-                            print(f"      ✓ K线数据获取成功 ({len(klines)}条)")
+                            if self.debug_mode:
+                                print(f"      ✓ K线数据获取成功 ({saved_count}条)")
                             return True
+                        except Exception as e:
+                            if self.debug_mode:
+                                print(f"      ⚠️ K线数据保存异常: {str(e)[:50]}")
+                            db.rollback()
                         finally:
                             db.close()
-            print(f"      ⚠️ K线获取失败，使用现有数据")
+            
+            if self.debug_mode:
+                print(f"      ⚠️ K线获取失败，使用现有数据")
             return True
             
         except Exception as e:
-            print(f"      ⚠️ K线获取异常: {str(e)[:50]}")
+            if self.debug_mode:
+                print(f"      ⚠️ K线获取异常: {str(e)[:100]}")
             return True
+
+    def _robust_request(self, url, params, timeout=20):
+        """增强版HTTP请求 - 带重试和错误处理"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params, timeout=timeout, verify=False)
+                
+                # 检查响应状态
+                if response.status_code == 200:
+                    return response
+                elif response.status_code in [429, 500, 502, 503, 504]:
+                    # 服务器错误，需要重试
+                    wait_time = (attempt + 1) * 2
+                    if self.debug_mode:
+                        print(f"      ⚠️ 服务器错误 {response.status_code}，{wait_time}秒后重试... ({attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # 其他错误
+                    if self.debug_mode:
+                        print(f"      ⚠️ HTTP错误 {response.status_code}")
+                    return None
+                    
+            except requests.exceptions.ConnectionError as e:
+                wait_time = (attempt + 1) * 3
+                if attempt < max_retries - 1:
+                    if self.debug_mode:
+                        print(f"      ⚠️ 连接错误，{wait_time}秒后重试... ({attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    if self.debug_mode:
+                        print(f"      ⚠️ 连接失败: {str(e)[:50]}")
+                    return None
+                    
+            except requests.exceptions.Timeout as e:
+                if attempt < max_retries - 1:
+                    if self.debug_mode:
+                        print(f"      ⚠️ 请求超时，重试中... ({attempt+1}/{max_retries})")
+                    continue
+                else:
+                    if self.debug_mode:
+                        print(f"      ⚠️ 请求超时: {str(e)[:50]}")
+                    return None
+                    
+            except Exception as e:
+                if self.debug_mode:
+                    print(f"      ⚠️ 请求异常: {str(e)[:50]}")
+                return None
+        
+        return None
         
     async def _fetch_kline_local(self, stock_code: str):
         """本地数据补充方案"""
@@ -487,32 +584,24 @@ class StockDataService:
             db.close()
 
     async def fetch_financial_metrics(self, stock_code: str):
-        """
-        获取财务指标 - 智能缓存增强版
-        支持缓存、多源、智能降级策略
-        返回: (ROE, 利润增长率)
-        """
-        # 检查缓存
+        """获取财务指标 - 修复版"""
+        # 缓存检查
         cache_key = f"financial_{stock_code}"
-        current_time = time.time()
+        if cache_key in self.financial_cache:
+            if time.time() < self.cache_expiry[cache_key]:
+                cached_data = self.financial_cache[cache_key]
+                if self.debug_mode:
+                    print(f"      ℹ️ 使用缓存财务数据: ROE={cached_data[0]:.2f}%, Growth={cached_data[1]:.2f}%")
+                return cached_data
         
-        if (cache_key in self.financial_cache and 
-            cache_key in self.cache_expiry and 
-            current_time < self.cache_expiry[cache_key]):
-            cached_data = self.financial_cache[cache_key]
-            if self.debug_mode:
-                print(f"      📦 使用缓存数据: ROE={cached_data[0]:.2f}%, Growth={cached_data[1]:.2f}%")
-            return cached_data
-        
-        # 初始化默认值
         roe, growth = 0.0, 0.0
         attempts = []
-        success_source = None
+        success_source = "none"
         
         try:
-            # 1. 尝试使用 efinance (主数据源)
+            # 1. 首选：efinance 财务数据
             attempts.append("efinance")
-            df = await asyncio.to_thread(ef.stock.get_base_info, stock_code)  # 移除 timeout 参数
+            df = await asyncio.to_thread(ef.stock.get_base_info, stock_code)
             
             if df is not None and not df.empty:
                 # 统一数据格式处理
@@ -547,83 +636,130 @@ class StockDataService:
                             break
                 
                 if roe != 0 or growth != 0:
-                    print(f"      ✓ 通过 efinance 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    if self.debug_mode:
+                        print(f"      ✓ 通过 efinance 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
                     success_source = "efinance"
+                    # 缓存结果
+                    self.financial_cache[cache_key] = (float(roe), float(growth))
+                    self.cache_expiry[cache_key] = time.time() + self.CACHE_TTL
                     return float(roe), float(growth)
                     
         except Exception as e:
-            print(f"      ⚠️ efinance 失败: {str(e)[:50]}")
+            if self.debug_mode:
+                print(f"      ⚠️ efinance 失败: {str(e)[:50]}")
         
         try:
-            # 2. 尝试 akshare 财务报表 (备用数据源1)
+            # 2. 备选：akshare 财务报表 (修复接口调用)
             attempts.append("akshare_financial")
-            # 标准化股票代码格式
             formatted_code = self._format_stock_code_for_akshare(stock_code)
-            df_fin = await asyncio.to_thread(ak.stock_financial_report_sina, symbol=formatted_code)  # 移除 timeout 参数
+            
+            # 使用正确的akshare接口
+            try:
+                df_fin = await asyncio.to_thread(ak.stock_financial_abstract_ths, symbol=stock_code)
+            except AttributeError:
+                # 如果上面接口不存在，尝试其他接口
+                try:
+                    df_fin = await asyncio.to_thread(ak.stock_financial_report_sina, symbol=formatted_code)
+                except:
+                    df_fin = None
             
             if df_fin is not None and not df_fin.empty and len(df_fin) > 0:
                 data_fin = df_fin.iloc[0].to_dict()
                 
                 # akshare 字段名
                 roe = self._safe_float(data_fin.get('净资产收益率') or 
-                                     data_fin.get('ROE') or 0)
+                                    data_fin.get('ROE') or 
+                                    data_fin.get('净资产收益率(%)') or 0)
                 growth = self._safe_float(data_fin.get('净利润同比增长') or 
-                                        data_fin.get('净利润增长率') or 0)
+                                        data_fin.get('净利润增长率') or 
+                                        data_fin.get('净利润同比(%)') or 0)
                 
                 if roe != 0 or growth != 0:
-                    print(f"      ✓ 通过 akshare 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    if self.debug_mode:
+                        print(f"      ✓ 通过 akshare 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
                     success_source = "akshare_financial"
+                    self.financial_cache[cache_key] = (float(roe), float(growth))
+                    self.cache_expiry[cache_key] = time.time() + self.CACHE_TTL
                     return float(roe), float(growth)
                     
         except Exception as e:
-            print(f"      ⚠️ akshare financial 失败: {str(e)[:50]}")
+            if self.debug_mode:
+                print(f"      ⚠️ akshare financial 失败: {str(e)[:50]}")
         
         try:
-            # 3. 尝试 akshare 主要指标 (备用数据源2)
+            # 3. 再备选：akshare 主要指标 (修复接口名称)
             attempts.append("akshare_indicator")
             formatted_code = self._format_stock_code_for_akshare(stock_code)
-            df_ind = await asyncio.to_thread(ak.stock_a_lg_indicator, symbol=formatted_code)  # 使用正确的函数名
+            
+            # 尝试多种akshare指标接口
+            df_ind = None
+            indicator_functions = [
+                'stock_a_indicator_lg',  # 正确的接口名
+                'stock_a_lg_indicator',  # 备选接口名
+                'stock_individual_info', # 其他可能的接口
+            ]
+            
+            for func_name in indicator_functions:
+                try:
+                    if hasattr(ak, func_name):
+                        df_ind = await asyncio.to_thread(getattr(ak, func_name), symbol=stock_code)
+                        if df_ind is not None and not df_ind.empty:
+                            break
+                except:
+                    continue
             
             if df_ind is not None and not df_ind.empty and len(df_ind) > 0:
                 data_ind = df_ind.iloc[0].to_dict()
                 
-                # 主要指标字段名
-                roe = self._safe_float(data_ind.get('净资产收益率(%)') or 
-                                     data_ind.get('ROE') or 0)
-                growth = self._safe_float(data_ind.get('净利润同比增长(%)') or 
-                                        data_ind.get('净利润增长率(%)') or 0)
+                # 指标字段名匹配
+                roe_fields = ['净资产收益率(%)', 'ROE', 'roe', '净资产收益率']
+                growth_fields = ['净利润同比(%)', '净利润增长率(%)', '净利润同比增长']
+                
+                for field in roe_fields:
+                    if field in data_ind and data_ind[field] is not None:
+                        roe_val = self._safe_float(data_ind[field])
+                        if roe_val != 0:
+                            roe = roe_val
+                            break
+                
+                for field in growth_fields:
+                    if field in data_ind and data_ind[field] is not None:
+                        growth_val = self._safe_float(data_ind[field])
+                        if growth_val != 0:
+                            growth = growth_val
+                            break
                 
                 if roe != 0 or growth != 0:
-                    print(f"      ✓ 通过 akshare indicator 获取财务数据: ROE={roe:.2f}%, Growth={growth:.2f}%")
+                    if self.debug_mode:
+                        print(f"      ✓ 通过 akshare 指标获取: ROE={roe:.2f}%, Growth={growth:.2f}%")
                     success_source = "akshare_indicator"
+                    self.financial_cache[cache_key] = (float(roe), float(growth))
+                    self.cache_expiry[cache_key] = time.time() + self.CACHE_TTL
                     return float(roe), float(growth)
                     
         except Exception as e:
-            print(f"      ⚠️ akshare indicator 失败: {str(e)[:50]}")
+            if self.debug_mode:
+                print(f"      ⚠️ akshare indicator 失败: {str(e)[:50]}")
         
+        # 4. 最后备选：从市场价格数据推算
         try:
-            # 4. 尝试从市场数据推算基础指标 (最终备用)
             attempts.append("market_derived")
             derived_roe, derived_growth = await self._derive_financial_from_market(stock_code)
             if derived_roe != 0 or derived_growth != 0:
-                print(f"      ✓ 通过市场数据推算: ROE={derived_roe:.2f}%, Growth={derived_growth:.2f}%")
-                return derived_roe, derived_growth
-                
+                if self.debug_mode:
+                    print(f"      ✓ 通过市场数据推算: ROE={derived_roe:.2f}%, Growth={derived_growth:.2f}%")
+                success_source = "market_derived"
+                self.financial_cache[cache_key] = (float(derived_roe), float(derived_growth))
+                self.cache_expiry[cache_key] = time.time() + self.CACHE_TTL
+                return float(derived_roe), float(derived_growth)
         except Exception as e:
-            print(f"      ⚠️ 市场数据推算失败: {str(e)[:50]}")
-        
-        # 数据质量评估和缓存
-        data_quality = self._assess_data_quality(roe, growth, success_source)
-        
-        if data_quality >= 0.7:  # 高质量数据才缓存
-            self.financial_cache[cache_key] = (float(roe), float(growth))
-            self.cache_expiry[cache_key] = current_time + self.CACHE_TTL
             if self.debug_mode:
-                print(f"      💾 缓存高质量数据 (质量: {data_quality:.2f})")
+                print(f"      ⚠️ 市场数据推算失败: {str(e)[:50]}")
         
         # 所有方法都失败，记录详细信息
         if roe == 0 and growth == 0:
-            print(f"      ❌ {stock_code} 财务指标获取完全失败 (尝试了: {', '.join(attempts)})")
+            if self.debug_mode:
+                print(f"      ❌ {stock_code} 财务指标获取完全失败 (尝试了: {', '.join(attempts)})")
         
         return float(roe), float(growth)
     
@@ -636,13 +772,13 @@ class StockDataService:
         return stock_code
     
     async def _derive_financial_from_market(self, stock_code: str):
-        """从市场价格数据推算基础财务指标"""
+        """从市场价格数据推算基础财务指标 - 增强版"""
         db = SessionLocal()
         try:
             # 获取历史价格数据推算趋势
             hist_data = db.query(HistoricalData).filter(
                 HistoricalData.stock_code == stock_code
-            ).order_by(desc(HistoricalData.date)).limit(252).all()  # 一年数据
+            ).order_by(HistoricalData.date.desc()).limit(252).all()  # 一年数据
             
             if len(hist_data) < 30:  # 数据不足
                 return 0.0, 0.0
@@ -657,12 +793,20 @@ class StockDataService:
                 derived_growth = 0.0
             
             # ROE 粗略估算 (假设合理的范围)
-            derived_roe = max(0, min(30, abs(derived_growth) * 0.8))  # 简单关联
+            # 对于科创板股票(688开头)，使用不同的估算逻辑
+            if stock_code.startswith('688'):
+                derived_roe = max(0, min(30, abs(derived_growth) * 0.6))  # 科创板估值更高
+            else:
+                derived_roe = max(0, min(30, abs(derived_growth) * 0.8))  # 传统股票
+            
+            if self.debug_mode:
+                print(f"      ℹ️ 市场数据推算: ROE≈{derived_roe:.2f}%, Growth≈{derived_growth:.2f}% (基于{len(prices)}天数据)")
             
             return float(derived_roe), float(derived_growth)
             
         except Exception as e:
-            print(f"      ⚠️ 市场数据推算异常: {str(e)[:50]}")
+            if self.debug_mode:
+                print(f"      ⚠️ 市场数据推算异常: {str(e)[:50]}")
             return 0.0, 0.0
         finally:
             db.close()
@@ -924,7 +1068,7 @@ class StockDataService:
             return None
 
     async def analyze_all_watched_stocks(self):
-        """主分析任务循环 - 智能增量更新版"""
+        """主分析任务循环 - 修复版"""
         db = SessionLocal()
         stats = {
             "success": 0, 
@@ -932,63 +1076,65 @@ class StockDataService:
             "financial_failed": 0,
             "network_errors": 0,
             "data_errors": 0,
-            "timeout_errors": 0
+            "timeout_errors": 0,
+            "total_processed": 0  # 改名为total_processed避免混淆
         }
         semaphore = asyncio.Semaphore(self.settings.CONCURRENT_LIMIT)
         
         try:
-            # 修复：去重并验证股票代码格式
+            # 获取关注股票列表
             watched_raw = db.query(UserStockWatch.stock_code).distinct().all()
             watched_codes = list(set([w[0] for w in watched_raw if w[0] and len(w[0]) == 6 and w[0].isdigit()]))
             total = len(watched_codes)
-            
-            # 添加重复检查日志
-            if len(watched_raw) != len(watched_codes):
-                print(f"⚠️ 发现重复股票代码，原始:{len(watched_raw)} 去重后:{len(watched_codes)}")
-            
-            # 智能增量更新检查
-            update_needed = await self._check_update_needed(db, [(code,) for code in watched_codes])
-            if not update_needed:
-                print("💡 数据已是最新，跳过更新")
-                return
             
             print(f"🚀 启动深度分析 (共 {total} 只)...")
             print(f"📊 配置: 并发数{self.settings.CONCURRENT_LIMIT}, 超时{self.settings.FINANCIAL_FETCH_TIMEOUT}s")
             
             # 获取高优先级股票
             priority_stocks = await self._get_priority_stocks(db, [(code,) for code in watched_codes])
+            print(f"🎯 优先处理 {len(priority_stocks)} 只重要股票...")
             
-            # 记录已处理的股票，防止重复
+            # 记录已处理的股票
             processed_stocks = set()
             tasks = []
             
-            async def process_stock(i, stock_code):
+            async def process_stock(stock_index, stock_code):
                 # 防止重复处理
                 if stock_code in processed_stocks:
-                    print(f"   ⚠️ {stock_code} 已在处理队列中，跳过")
                     return
                 processed_stocks.add(stock_code)
                 
                 async with semaphore:
                     try:
+                        stats["total_processed"] += 1
+                        current_index = stats["total_processed"]
+                        
                         # 智能跳过K线失败的股票
-                        if not await self.fetch_historical_data(stock_code):
+                        kline_success = await self.fetch_historical_data(stock_code)
+                        if not kline_success and self.debug_mode:
                             print(f"      ⚠️ K线获取失败，但仍继续分析...")
+                        
                         await self.fetch_stock_dividend_history(stock_code)
                         score = await self.analyze_stock(stock_code, db)
                         
                         if score is not None:
                             stats["success"] += 1
-                            print(f"   ✓ {i}/{total} {stock_code} 分析完成 (评分: {score})")
+                            # 修复成功率计算
+                            success_rate = (stats["success"] / current_index) * 100 if current_index > 0 else 0
+                            print(f"   ✓ {current_index}/{total} {stock_code} 分析完成 (评分: {score}, 成功率: {success_rate:.1f}%)")
                         else:
                             stats["failed"] += 1
-                            print(f"   ❌ {i}/{total} {stock_code} 分析失败")
+                            success_rate = (stats["success"] / current_index) * 100 if current_index > 0 else 0
+                            print(f"   ❌ {current_index}/{total} {stock_code} 分析失败 (成功率: {success_rate:.1f}%)")
                         
                     except Exception as e:
                         stats["failed"] += 1
+                        stats["total_processed"] += 1
+                        current_index = stats["total_processed"]
+                        success_rate = (stats["success"] / current_index) * 100 if current_index > 0 else 0
                         error_msg = str(e).lower()
                         
-                        if "connection" in error_msg or "timeout" in error_msg:
+                        if "connection" in error_msg or "disconnected" in error_msg:
                             stats["network_errors"] += 1
                         elif "timeout" in error_msg:
                             stats["timeout_errors"] += 1
@@ -997,30 +1143,23 @@ class StockDataService:
                         else:
                             stats["financial_failed"] += 1
                         
-                        print(f"   ❌ {i}/{total} {stock_code} 处理异常: {str(e)[:50]}")
+                        print(f"   ❌ {current_index}/{total} {stock_code} 处理异常: {str(e)[:50]} (成功率: {success_rate:.1f}%)")
                     
-                    # 智能延迟 + 进度显示
+                    # 延迟策略
                     delay = random.uniform(
                         self.settings.FETCH_DELAY_MIN, 
                         self.settings.FETCH_DELAY_MAX
                     )
                     
                     # 显示详细进度
-                    success_rate = (stats["success"] / i * 100) if i > 0 else 0
-                    eta_minutes = ((total - i) * (self.settings.FETCH_DELAY_MAX + self.settings.FETCH_DELAY_MIN) / 2) / 60
-                    
-                    print(f"   💤 等待 {delay:.1f} 秒... (成功率: {success_rate:.1f}%, 预计剩余: {eta_minutes:.1f}分钟)")
+                    remaining = total - current_index
+                    eta_minutes = (remaining * delay) / 60 if remaining > 0 else 0
+                    print(f"   💤 等待 {delay:.1f} 秒... (预计剩余: {eta_minutes:.1f}分钟)")
                     await asyncio.sleep(delay)
             
-            # 先处理高优先级股票
-            print(f"🎯 优先处理 {len(priority_stocks)} 只重要股票...")
-            for i, code in enumerate(priority_stocks, 1):
-                tasks.append(process_stock(i, code))
-            
-            # 再处理其他股票
-            remaining_stocks = [code for code in watched_codes if code not in priority_stocks]
-            print(f"📋 处理剩余 {len(remaining_stocks)} 只股票...")
-            for i, code in enumerate(remaining_stocks, len(priority_stocks) + 1):
+            # 处理所有股票
+            all_stocks = priority_stocks + [code for code in watched_codes if code not in priority_stocks]
+            for i, code in enumerate(all_stocks, 1):
                 tasks.append(process_stock(i, code))
                 
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1032,7 +1171,15 @@ class StockDataService:
             print(f"   总数: {total}")
             print(f"   成功: {stats['success']} ({final_success_rate:.1f}%)")
             print(f"   失败: {stats['failed']}")
-            
+            if stats["network_errors"] > 0:
+                print(f"   网络错误: {stats['network_errors']}")
+            if stats["timeout_errors"] > 0:
+                print(f"   超时错误: {stats['timeout_errors']}")
+            if stats["data_errors"] > 0:
+                print(f"   数据错误: {stats['data_errors']}")
+            if stats["financial_failed"] > 0:
+                print(f"   财务数据失败: {stats['financial_failed']}")
+                
         except Exception as e:
             print(f"🚨 分析过程中发生严重错误: {e}")
             import traceback

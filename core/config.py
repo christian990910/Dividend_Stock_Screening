@@ -24,20 +24,25 @@ class Settings(BaseSettings):
     SENDER_NAME: str = "价值分析系统"
     
     # 财务数据抓取配置
-    FINANCIAL_FETCH_TIMEOUT: int = 15      # 财务数据获取超时时间(秒)
-    FINANCIAL_RETRY_COUNT: int = 3         # 财务数据重试次数
-    ENABLE_FINANCIAL_FALLBACK: bool = True # 是否启用降级策略
-    MIN_VALID_FINANCIAL_DATA: float = 0.1  # 最小有效财务数据阈值
-    CACHE_ENABLED: bool = True             # 启用数据缓存
-    CACHE_TTL_SECONDS: int = 3600          # 缓存有效期(秒)
-    CONCURRENT_LIMIT: int = 3              # 最大并发数
-    QUALITY_THRESHOLD: float = 0.7         # 数据质量阈值
+    FINANCIAL_FETCH_TIMEOUT: int = 20      # 增加超时时间到20秒
+    FINANCIAL_RETRY_COUNT: int = 5         # 增加重试次数到5次
+    ENABLE_FINANCIAL_FALLBACK: bool = True
+    MIN_VALID_FINANCIAL_DATA: float = 0.1
+    CACHE_ENABLED: bool = True
+    CACHE_TTL_SECONDS: int = 7200          # 增加缓存时间到2小时
+    CONCURRENT_LIMIT: int = 2              # 保持并发数2
+    QUALITY_THRESHOLD: float = 0.7
     
     # 抓取延迟配置
-    FETCH_DELAY_MIN: float = 5.0           # 最小抓取间隔(秒)
-    FETCH_DELAY_MAX: float = 30.0          # 最大抓取间隔(秒)
-    BATCH_SIZE: int = 5                    # 批量处理大小
-    PRIORITY_FIRST: bool = True            # 优先处理重要股票
+    FETCH_DELAY_MIN: float = 3.0           # 减少最小延迟
+    FETCH_DELAY_MAX: float = 20.0          # 减少最大延迟
+    BATCH_SIZE: int = 10                   # 增加批处理大小
+    PRIORITY_FIRST: bool = True
+    
+    # 新增网络稳定性配置
+    NETWORK_RETRY_BACKOFF: float = 1.5     # 重试退避因子
+    MAX_NETWORK_ERRORS: int = 10           # 最大连续网络错误数
+    ADAPTIVE_DELAY_MULTIPLIER: float = 2.0 # 自适应延迟倍数
 
     class Config:
         # 核心修改：使用绝对路径确保无论从哪里启动都能读到 .env
