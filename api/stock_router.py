@@ -193,3 +193,46 @@ def get_system_status(db: Session = Depends(get_db)):
             "analysis_sync": db.query(func.max(StockAnalysisResult.analysis_date)).scalar()
         }
     }
+
+@router.get("/diagnose/{stock_code}")
+async def diagnose_stock_issues(stock_code: str, db: Session = Depends(get_db)):
+    """诊断特定股票的数据问题"""
+    # 检查分析记录
+    analysis_records = db.query(StockAnalysisResult).filter(
+        StockAnalysisResult.stock_code == stock_code
+    ).order_by(desc(StockAnalysisResult.analysis_date)).limit(20).all()
+    
+    # 检查市场数据
+    market_data = db.query(DailyMarketData).filter(
+        DailyMarketData.code == stock_code
+    ).order_by(desc(DailyMarketData.date)).first()
+    
+    diagnosis = {
+        "stock_code": stock_code,
+        "total_analyses": len(analysis_records),
+        "recent_analyses": [
+            {
+                "date": str(record.analysis_date),
+                "pe_ratio": record.pe_ratio,
+                "total_score": record.total_score,
+                "suggestion": record.suggestion
+            }
+            for record in analysis_records[:10]
+        ],
+        "market_data": {
+            "latest_pe": market_data.pe_dynamic if market_data else None,
+            "latest_price": market_data.latest_price if market_data else None
+        } if market_data else None,
+        "issues": []
+    }
+    
+    # 检测问题
+    abnormal_pe_count = sum(1 for r in analysis_records if r.pe_ratio > 1000000)
+    if abnormal_pe_count > 0:
+        diagnosis["issues"].append(f"发现{abnormal_pe_count}条异常PE数据")
+    
+    duplicate_count = len(analysis_records) - len(set(r.analysis_date for r in analysis_records))
+    if duplicate_count > 0:
+        diagnosis["issues"].append(f"发现{duplicate_count}条重复分析记录")
+    
+    return diagnosis

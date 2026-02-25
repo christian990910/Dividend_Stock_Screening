@@ -76,9 +76,18 @@ class StockDataService:
                 val = val.strip().replace(',', '')  # 移除千分位逗号
                 if val.lower() in ['--', 'null', 'nan', 'none']:
                     return 0.0
-            return float(val)
+        
+            result = float(val)
+            
+            # 添加异常值检查
+            if result > 1000000:  # 超过100万的PE值视为异常
+                print(f"      ⚠️ 检测到异常PE值: {result}, 已修正为0")
+                return 0.0
+            if result < 0:  # 负PE值处理
+                return 0.0
+                
+            return result
         except (ValueError, TypeError) as e:
-            # 更详细的错误日志
             if hasattr(self, 'debug_mode') and self.debug_mode:
                 print(f"      ⚠️ 数值转换警告: '{val}' -> 0.0 ({str(e)})")
             return 0.0
@@ -917,14 +926,20 @@ class StockDataService:
             "data_errors": 0,
             "timeout_errors": 0
         }
-        semaphore = asyncio.Semaphore(self.settings.CONCURRENT_LIMIT)  # 从配置读取并发数
+        semaphore = asyncio.Semaphore(self.settings.CONCURRENT_LIMIT)
         
         try:
-            watched = db.query(UserStockWatch.stock_code).distinct().all()
-            total = len(watched)
+            # 修复：去重并验证股票代码格式
+            watched_raw = db.query(UserStockWatch.stock_code).distinct().all()
+            watched_codes = list(set([w[0] for w in watched_raw if w[0] and len(w[0]) == 6 and w[0].isdigit()]))
+            total = len(watched_codes)
+            
+            # 添加重复检查日志
+            if len(watched_raw) != len(watched_codes):
+                print(f"⚠️ 发现重复股票代码，原始:{len(watched_raw)} 去重后:{len(watched_codes)}")
             
             # 智能增量更新检查
-            update_needed = await self._check_update_needed(db, watched)
+            update_needed = await self._check_update_needed(db, [(code,) for code in watched_codes])
             if not update_needed:
                 print("💡 数据已是最新，跳过更新")
                 return
@@ -932,19 +947,27 @@ class StockDataService:
             print(f"🚀 启动深度分析 (共 {total} 只)...")
             print(f"📊 配置: 并发数{self.settings.CONCURRENT_LIMIT}, 超时{self.settings.FINANCIAL_FETCH_TIMEOUT}s")
             
-            # 优先处理重要股票
-            priority_stocks = await self._get_priority_stocks(db, watched)
+            # 获取高优先级股票
+            priority_stocks = await self._get_priority_stocks(db, [(code,) for code in watched_codes])
+            
+            # 记录已处理的股票，防止重复
+            processed_stocks = set()
             tasks = []
             
             async def process_stock(i, stock_code):
-                async with semaphore:  # 控制并发
+                # 防止重复处理
+                if stock_code in processed_stocks:
+                    print(f"   ⚠️ {stock_code} 已在处理队列中，跳过")
+                    return
+                processed_stocks.add(stock_code)
+                
+                async with semaphore:
                     try:
                         # 智能跳过K线失败的股票
-                        if not await self.fetch_historical_data(code):
+                        if not await self.fetch_historical_data(stock_code):
                             print(f"      ⚠️ K线获取失败，但仍继续分析...")
-                            # 继续执行其他分析步骤
-                        await self.fetch_stock_dividend_history(code)
-                        score = await self.analyze_stock(code, db)
+                        await self.fetch_stock_dividend_history(stock_code)
+                        score = await self.analyze_stock(stock_code, db)
                         
                         if score is not None:
                             stats["success"] += 1
@@ -952,7 +975,7 @@ class StockDataService:
                         else:
                             stats["failed"] += 1
                             print(f"   ❌ {i}/{total} {stock_code} 分析失败")
-                            
+                        
                     except Exception as e:
                         stats["failed"] += 1
                         error_msg = str(e).lower()
@@ -987,7 +1010,7 @@ class StockDataService:
                 tasks.append(process_stock(i, code))
             
             # 再处理其他股票
-            remaining_stocks = [row[0] for row in watched if row[0] not in priority_stocks]
+            remaining_stocks = [code for code in watched_codes if code not in priority_stocks]
             print(f"📋 处理剩余 {len(remaining_stocks)} 只股票...")
             for i, code in enumerate(remaining_stocks, len(priority_stocks) + 1):
                 tasks.append(process_stock(i, code))
@@ -1004,6 +1027,8 @@ class StockDataService:
             
         except Exception as e:
             print(f"🚨 分析过程中发生严重错误: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             db.close()
     
@@ -1073,5 +1098,63 @@ class StockDataService:
                 self.settings.FETCH_DELAY_MAX,
                 self.settings.FETCH_DELAY_MAX * 2
             )
+    async def clean_abnormal_pe_data(self):
+        """清理异常的PE数据"""
+        db = SessionLocal()
+        try:
+            # 查找异常PE值的记录
+            abnormal_records = db.query(StockAnalysisResult).filter(
+                StockAnalysisResult.pe_ratio > 1000000
+            ).all()
+            
+            if abnormal_records:
+                print(f"🔍 发现 {len(abnormal_records)} 条异常PE数据记录")
+                for record in abnormal_records:
+                    print(f"   {record.stock_code} - {record.analysis_date}: PE={record.pe_ratio}")
+                    # 修正为0或重新计算
+                    record.pe_ratio = 0.0
+                    
+                db.commit()
+                print("✅ 异常PE数据已清理")
+            else:
+                print("✅ 未发现异常PE数据")
+                
+        except Exception as e:
+            print(f"❌ 清理异常数据失败: {e}")
+        finally:
+            db.close()
+
+    async def validate_analysis_data(self):
+        """验证分析数据的合理性"""
+        db = SessionLocal()
+        try:
+            # 检查最近一周的分析数据
+            one_week_ago = datetime.date.today() - datetime.timedelta(days=7)
+            
+            suspicious_records = db.query(StockAnalysisResult).filter(
+                StockAnalysisResult.analysis_date >= one_week_ago,
+                (StockAnalysisResult.pe_ratio > 1000000) | 
+                (StockAnalysisResult.pe_ratio < 0) |
+                (StockAnalysisResult.total_score > 100) |
+                (StockAnalysisResult.total_score < 0)
+            ).all()
+            
+            if suspicious_records:
+                print(f"⚠️ 发现 {len(suspicious_records)} 条可疑数据:")
+                for record in suspicious_records:
+                    issues = []
+                    if record.pe_ratio > 1000000 or record.pe_ratio < 0:
+                        issues.append(f"PE异常({record.pe_ratio})")
+                    if record.total_score > 100 or record.total_score < 0:
+                        issues.append(f"评分异常({record.total_score})")
+                    
+                    print(f"   {record.stock_code} {record.analysis_date}: {', '.join(issues)}")
+            else:
+                print("✅ 数据验证通过")
+                
+        except Exception as e:
+            print(f"❌ 数据验证失败: {e}")
+        finally:
+            db.close()
 
 stock_service = StockDataService()
