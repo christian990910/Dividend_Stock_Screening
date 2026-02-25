@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
+
+from fastapi import APIRouter, Depends, HTTPException, status  # 添加status导入
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from core.database import get_db
@@ -27,7 +28,7 @@ def login(
     
     if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_401_UNAUTHORIZED,  # 修复：添加status前缀
             detail="用户名或密码错误",
             headers={"WWW-Authenticate": "Bearer"},
         )

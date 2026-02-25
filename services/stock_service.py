@@ -294,7 +294,7 @@ class StockDataService:
         finally: db.close()
 
     async def _request_with_retry(self, url, params, max_retries=3):
-        """内部通用的重试请求包装器"""
+        """增强版重试请求包装器"""
         for i in range(max_retries):
             try:
                 # 在线程中执行同步请求
@@ -303,16 +303,22 @@ class StockDataService:
                 )
                 if response.status_code == 200:
                     return response.json()
-            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-                wait_time = (i + 1) * 2
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError, requests.exceptions.RemoteDisconnected) as e:
+                wait_time = (i + 1) * 3  # 增加等待时间
                 if i < max_retries - 1:
+                    print(f"      ⚠️ 网络连接失败，{wait_time}秒后重试... ({i+1}/{max_retries})")
                     await asyncio.sleep(wait_time)
+                    continue
+                raise e
+            except requests.exceptions.Timeout as e:
+                if i < max_retries - 1:
+                    print(f"      ⚠️ 请求超时，重试中... ({i+1}/{max_retries})")
                     continue
                 raise e
         return None
     
     async def fetch_historical_data(self, stock_code: str):
-        """同步历史K线 - 完整版(含正确请求头)"""
+        """同步历史K线 - 优化版"""
         # 首先检查本地数据
         db = SessionLocal()
         try:
@@ -320,7 +326,8 @@ class StockDataService:
                 HistoricalData.stock_code == stock_code
             ).count()
             
-            if existing_count >= 30:
+            # 优化：如果已有足够数据（比如100条以上），就不重复获取
+            if existing_count >= 100:
                 print(f"      ℹ️ 已有{existing_count}条K线数据，跳过获取")
                 return True
         finally:
@@ -346,7 +353,8 @@ class StockDataService:
                 "ut": self.target_ut,
                 "fields1": "f1,f2,f3,f4,f5,f6",
                 "fields2": "f51,f52,f53,f54,f55,f56",
-                "klt": "101", "fqt": "1", "beg": "0", "end": "20500101", "lmt": "120", "_": str(int(time.time() * 1000))
+                "klt": "101", "fqt": "1", "beg": "0", "end": "20500101", 
+                "lmt": "120", "_": str(int(time.time() * 1000))  # 限制获取120条数据
             }
             
             # 使用带有完整请求头的会话
@@ -363,6 +371,7 @@ class StockDataService:
                     if klines:
                         db = SessionLocal()
                         try:
+                            # 只保留最新的120条数据，避免数据膨胀
                             db.query(HistoricalData).filter(HistoricalData.stock_code == stock_code).delete()
                             for line in klines:
                                 cols = line.split(',')
@@ -374,18 +383,17 @@ class StockDataService:
                                 )
                                 db.add(h)
                             db.commit()
-                            print(f"      ✓ K线数据获取成功")
+                            print(f"      ✓ K线数据获取成功 ({len(klines)}条)")
                             return True
                         finally:
                             db.close()
-            
             print(f"      ⚠️ K线获取失败，使用现有数据")
             return True
             
         except Exception as e:
             print(f"      ⚠️ K线获取异常: {str(e)[:50]}")
             return True
-    
+        
     async def _fetch_kline_local(self, stock_code: str):
         """本地数据补充方案"""
         db = SessionLocal()
