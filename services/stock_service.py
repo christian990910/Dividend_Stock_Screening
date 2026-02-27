@@ -21,6 +21,11 @@ from crud.stock import save_market_data_batch, save_analysis_result
 
 class StockDataService:
     def __init__(self):
+        import os
+        for key in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']:
+            os.environ.pop(key, None)
+        os.environ['NO_PROXY'] = '*'
+        
         self.settings = settings
         self.debug_mode = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
         

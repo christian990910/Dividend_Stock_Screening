@@ -1,20 +1,12 @@
 import os
 import socket
+import urllib.request  # ← 移到这里
 import urllib3
-import asyncio
-import datetime
-import logging
-import uvicorn
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-import urllib.request
 
 # ============================================================
-# 顶级补丁：禁用代理并强制 IPv4 (必须放在所有 import 之前)
+# 顶级补丁：必须在所有其他 import 之前执行
 # ============================================================
-socket.setdefaulttimeout(30)  # 强制所有 socket 30秒超时
+socket.setdefaulttimeout(30)
 orig_getaddrinfo = socket.getaddrinfo
 
 def patched_getaddrinfo(*args, **kwargs):
@@ -22,12 +14,24 @@ def patched_getaddrinfo(*args, **kwargs):
     return [r for r in res if r[0] == socket.AF_INET]
 
 socket.getaddrinfo = patched_getaddrinfo
-os.environ['NO_PROXY'] = '*'  # 禁用所有请求的代理
+os.environ['NO_PROXY'] = '*'
 os.environ['http_proxy'] = ''
 os.environ['https_proxy'] = ''
+os.environ['HTTP_PROXY'] = ''   # ← 加上大写版本
+os.environ['HTTPS_PROXY'] = ''  # ← 加上大写版本
 urllib.request.getproxies = lambda: {}
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================
+
+import asyncio  # ← 其余 import 在补丁之后
+import datetime
+import logging
+import uvicorn
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 
 # 导入核心配置与模型
 from core.database import engine, Base, SessionLocal
