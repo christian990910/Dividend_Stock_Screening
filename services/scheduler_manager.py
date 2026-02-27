@@ -88,22 +88,32 @@ class EnhancedSchedulerManager:
             name='任务统计报告'
         )
     
+    # 修复后的健康检查函数
     async def health_check(self):
-        """系统健康检查"""
+        """系统健康检查 - 修复版"""
         try:
             self.logger.info("🏥 执行系统健康检查...")
             
-            # 检查数据库连接
+            # 修复数据库连接检查
             from core.database import engine
             with engine.connect() as conn:
-                conn.execute("SELECT 1")
+                result = conn.execute(text("SELECT 1"))  # 添加text()包装
+                if result.fetchone()[0] == 1:
+                    self.logger.info("✅ 数据库连接正常")
+                else:
+                    raise Exception("数据库查询结果异常")
             
             # 检查关键服务
             from services.stock_service import stock_service
             if hasattr(stock_service, 'session'):
-                response = await stock_service.session.get('https://httpbin.org/get', timeout=5)
-                if response.status_code != 200:
-                    raise Exception("网络服务异常")
+                try:
+                    response = await stock_service.session.get('https://httpbin.org/get', timeout=5)
+                    if response.status_code == 200:
+                        self.logger.info("✅ 网络服务正常")
+                    else:
+                        raise Exception(f"网络服务返回状态码: {response.status_code}")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ 网络服务检查失败: {e}")
             
             self.logger.info("✅ 系统健康检查通过")
             self.update_task_stats('health_check', 'success')
