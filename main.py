@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import urllib.request
 
 # ============================================================
 # 顶级补丁：禁用代理并强制 IPv4 (必须放在所有 import 之前)
@@ -24,6 +25,7 @@ socket.getaddrinfo = patched_getaddrinfo
 os.environ['NO_PROXY'] = '*'  # 禁用所有请求的代理
 os.environ['http_proxy'] = ''
 os.environ['https_proxy'] = ''
+urllib.request.getproxies = lambda: {}
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================
 

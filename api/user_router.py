@@ -1,45 +1,102 @@
-
-from fastapi import APIRouter, Depends, HTTPException, status  # 添加status导入
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from typing import List
+from fastapi.security import OAuth2PasswordRequestForm
+from datetime import timedelta
 from core.database import get_db
-from core.security import verify_password, create_access_token
 from core.auth_dependency import get_current_user
-from schemas.user import UserRegister, UserLogin, TokenResponse, UserOut
-import crud.user as crud_user
+from core.security import create_access_token
+from schemas.user import UserCreate, UserLogin, UserUpdate, UserResponse, Token
+from crud.user import (
+    create_user, get_user_by_account, get_user_by_id, get_users, update_user, 
+    delete_user, authenticate_user, update_last_login
+)
+from models.user import User
 
-router = APIRouter(prefix="/users", tags=["用户系统"])
+router = APIRouter(prefix="/api/users", tags=["用户管理"])
 
-@router.post("/register", response_model=UserOut)
-def register(user_in: UserRegister, db: Session = Depends(get_db)):
-    if crud_user.get_user_by_account(db, user_in.account):
-        raise HTTPException(status_code=400, detail="Account already exists")
-    return crud_user.create_user(db, user_in)
+@router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    """用户注册"""
+    db_user = get_user_by_account(db, user.account)
+    if db_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="账号已存在"
+        )
+    return create_user(db, user)
 
-@router.post("/login", response_model=TokenResponse)
-def login(
-    # 使用 OAuth2PasswordRequestForm 替代原来的 UserLogin 模型
-    # 这会让接口同时支持 Swagger 的表单提交
-    form_data: OAuth2PasswordRequestForm = Depends(), 
+
+@router.post("/login", response_model=Token)
+async def login(credentials: UserLogin, db: Session = Depends(get_db)):
+    """用户登录"""
+    user = authenticate_user(db, credentials.account, credentials.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="账号或密码错误"
+        )
+    update_last_login(db, user.user_id)
+    from core.security import create_access_token
+    access_token = create_access_token(data={"sub": user.account})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.get("/me", response_model=UserResponse)
+def read_users_me(current_user: User = Depends(get_current_user)):
+    """获取当前用户信息"""
+    return current_user
+
+@router.get("/{user_id}", response_model=UserResponse)
+def read_user(user_id: int, db: Session = Depends(get_db)):
+    """获取指定用户信息"""
+    db_user = get_user_by_id(db, user_id)
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return db_user
+
+@router.put("/{user_id}", response_model=UserResponse)
+def update_user_info(
+    user_id: int, 
+    user_update: UserUpdate, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """更新用户信息"""
+    if current_user.user_id != user_id:
+        raise HTTPException(status_code=403, detail="权限不足")
+    
+    db_user = update_user(db, user_id, user_update)
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return db_user
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user_account(
+    user_id: int, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """删除用户账户"""
+    if current_user.user_id != user_id:
+        raise HTTPException(status_code=403, detail="权限不足")
+    
+    if not delete_user(db, user_id):
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+@router.post("/token", response_model=Token)
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-    # 注意：这里要用 form_data.username，它对应你数据库里的 account
-    user = crud_user.get_user_by_account(db, form_data.username)
-    
-    if not user or not verify_password(form_data.password, user.password_hash):
+    """OAuth2 标准登录端点"""
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,  # 修复：添加status前缀
-            detail="用户名或密码错误",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="账号或密码错误",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    # 生成 Token
-    token = create_access_token({"sub": user.account})
-    crud_user.update_last_login(db, user.user_id)
-    
-    # 返回格式必须包含 access_token 和 token_type
-    return {"access_token": token, "token_type": "bearer"}
-
-@router.get("/me", response_model=UserOut)
-def get_me(current_user: UserOut = Depends(get_current_user)):
-    return current_user
+    update_last_login(db, user.user_id)
+    access_token = create_access_token(data={"sub": user.account})
+    return {"access_token": access_token, "token_type": "bearer"}
