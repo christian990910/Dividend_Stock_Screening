@@ -182,34 +182,76 @@ class StockDataService:
     # --- 核心抓取逻辑 (完全还原你提供的代码) ---
 
     async def fetch_em_data_via_web_api(self, page_size: int = 100) -> pd.DataFrame:
-        """增强版数据抓取 - 完全匹配你提供的API格式"""
+        """增强版数据抓取 - 双重保障 (Akshare官方接口 + 极简防屏蔽直连)"""
+        print(f"\n🌐 启动全市场行情抓取...")
+
+        # 🏆 方案 A: 优先使用开源社区持续更新的 Akshare 接口 (最稳定、最抗封)
+        try:
+            print("   ➤ 尝试使用 Akshare 官方通道获取数据...")
+            # 调用 akshare 的东方财富实时行情接口
+            df = await asyncio.to_thread(ak.stock_zh_a_spot_em)
+            if df is not None and not df.empty:
+                print("   ✓ Akshare 通道获取成功！")
+                
+                # 映射 akshare 的中文列名到数据库英文字段
+                ak_map = {
+                    '代码': 'code',
+                    '名称': 'name',
+                    '最新价': 'latest_price',
+                    '涨跌幅': 'change_pct',
+                    '市盈率-动态': 'pe_dynamic',
+                    '市净率': 'pb',
+                    '成交量': 'volume',
+                    '成交额': 'amount'
+                }
+                df = df.rename(columns=ak_map)
+                
+                # 清洗可能的非数值 (把 '-' 或 'NaN' 转为 0)
+                for col in ['latest_price', 'change_pct', 'pe_dynamic', 'pb', 'volume', 'amount']:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                        
+                print(f"✅ 总计获取 {len(df)} 条数据")
+                return df
+                
+        except Exception as e:
+            print(f"   ⚠️ Akshare 通道失败: {str(e)[:100]}")
+            print("   🔄 自动切换至纯净备用通道...")
+
+        # 🛡️ 方案 B: 极简纯净 HTTP 直连 
+        # (去掉复杂的假Cookie，仅保留最核心的浏览器头部，防止画蛇添足被拦截)
+        print("   ➤ 启用原生极简 HTTP 瀑布流抓取...")
         all_dfs = []
         current_page = 1
         total_pages = 999
         url = "https://push2.eastmoney.com/api/qt/clist/get"
 
         headers = {
+            "Host": "push2.eastmoney.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Connection": "keep-alive",
-            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": "https://quote.eastmoney.com/",
+            "Connection": "keep-alive"
         }
 
-        print(f"\n🌐 启动增强版数据抓取 (每页 {page_size} 条)")
-        
+        # 构建一个带重试机制的纯净 Session
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
         session = requests.Session()
-        session.trust_env = False
-        session.proxies = {"http": None, "https": None}
-        session.cookies.update(self.target_cookies)
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[403, 429, 500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.headers.update(headers)
 
         while current_page <= total_pages:
-            # 完全匹配你提供的参数格式
+            cb_name = f"jQuery3410{random.randint(100000, 999999)}_{int(time.time()*1000)}"
             params = {
-                "cb": f"jQuery341015241163678647807_{int(time.time()*1000)}",
+                "cb": cb_name,
                 "pn": str(current_page),
                 "np": "1",
-                "ut": self.target_ut,
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                 "fltt": "2",
                 "invt": "2",
                 "fs": "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:81+s:2048",
@@ -223,59 +265,47 @@ class StockDataService:
 
             try:
                 print(f"   ➤ 抓取第 {current_page}/{total_pages if total_pages != 999 else '?'} 页...")
-                response = await asyncio.to_thread(session.get, url, params=params, headers=headers, timeout=20, verify=False)
+                response = await asyncio.to_thread(session.get, url, params=params, timeout=15, verify=False)
                 
                 if response.status_code != 200: break
+                match = re.search(r'jQuery.*?\((.*)\)', response.text)
+                if not match: break
 
-                raw_text = response.text
-                json_match = re.search(r'jQuery.*?\((.*)\)', raw_text)
-                if not json_match: break
+                res_json = json.loads(match.group(1))
+                if not res_json or not res_json.get("data"): break
 
-                res_json = json.loads(json_match.group(1))
-                if not res_json or not res_json.get("data"):
-                    if self.refresh_ut():
-                        params["ut"] = self.target_ut
-                        # 重试逻辑...
-                        continue
-                    else: break
-
+                # 第一页获取总页数
                 if current_page == 1:
-                    total_records = res_json["data"]["total"]
-                    total_pages = (total_records + page_size - 1) // page_size
-                    print(f"   📊 全市场共 {total_records} 只股票，预计 {total_pages} 页")
+                    total_pages = (res_json["data"]["total"] + page_size - 1) // page_size
 
                 batch_df = pd.DataFrame(res_json["data"]["diff"])
                 all_dfs.append(batch_df)
 
                 if current_page >= total_pages: break
-
-                # ✅ 还原你原来的高随机等待时间 (10-50秒)，这是不掉线的关键
-                wait_time = random.uniform(10, 50)
-                print(f"   💤 随机等待 {wait_time:.1f} 秒...")
+                
+                # 备用方案稍微短一点的等待时间
+                wait_time = random.uniform(2.5, 6.0)
                 await asyncio.sleep(wait_time)
                 current_page += 1
 
             except Exception as e:
-                print(f"   ❌ 第 {current_page} 页失败: {str(e)[:100]}")
+                print(f"   ❌ 备用通道报错停止: {str(e)[:50]}")
                 break
 
         session.close()
         if not all_dfs: return pd.DataFrame()
 
         final_df = pd.concat(all_dfs, ignore_index=True)
-        final_df = final_df.rename(columns=self.em_fields_map)
-
-        # ✅ 还原字段完整性统计显示
-        print(f"\n✅ 总计获取 {len(final_df)} 条数据")
-        print(f"\n📊 字段完整性统计:")
-        for col in ['code', 'name', 'latest_price', 'pe_dynamic', 'pb']:
-            if col in final_df.columns:
-                non_null = final_df[col].notna().sum()
-                pct = (non_null / len(final_df)) * 100
-                print(f"   [{'✅' if pct > 90 else '⚠️'}] {col:20s}: {non_null:5d}/{len(final_df)} ({pct:5.1f}%)")
-
+        em_fields_map = {
+            'f12': 'code', 'f14': 'name', 'f2': 'latest_price', 
+            'f3': 'change_pct', 'f9': 'pe_dynamic', 'f22': 'pb', 
+            'f5': 'volume', 'f6': 'amount'
+        }
+        rename_map = {k: v for k, v in em_fields_map.items() if k in final_df.columns}
+        final_df = final_df.rename(columns=rename_map)
+        
+        print(f"\n✅ 备用通道获取 {len(final_df)} 条数据")
         return final_df
-
 
     async def fetch_daily_market_data(self, force: bool = False):
         """入库逻辑整合"""
@@ -440,55 +470,32 @@ class StockDataService:
             return True
 
     def _robust_request(self, url, params, timeout=20):
-        """增强版HTTP请求 - 带重试和错误处理"""
+        """增强版HTTP请求 - 遇到403/429自动重试与反爬休眠"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                response = self.session.get(url, params=params, timeout=timeout, verify=False)
+                # 动态追加防爬头部
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                    "Referer": "https://quote.eastmoney.com/"
+                }
+                response = self.session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
                 
-                # 检查响应状态
                 if response.status_code == 200:
                     return response
-                elif response.status_code in [429, 500, 502, 503, 504]:
-                    # 服务器错误，需要重试
-                    wait_time = (attempt + 1) * 2
-                    if self.debug_mode:
-                        print(f"      ⚠️ 服务器错误 {response.status_code}，{wait_time}秒后重试... ({attempt+1}/{max_retries})")
-                    time.sleep(wait_time)
+                elif response.status_code in [403, 429]:
+                    if getattr(self, 'debug_mode', False):
+                        print(f"      ⚠️ 被反爬拦截 (HTTP {response.status_code})，休眠伪装中...")
+                    time.sleep(random.uniform(5, 12))
+                    continue
+                elif response.status_code in [500, 502, 503, 504]:
+                    time.sleep((attempt + 1) * 2)
                     continue
                 else:
-                    # 其他错误
-                    if self.debug_mode:
-                        print(f"      ⚠️ HTTP错误 {response.status_code}")
                     return None
-                    
-            except requests.exceptions.ConnectionError as e:
-                wait_time = (attempt + 1) * 3
-                if attempt < max_retries - 1:
-                    if self.debug_mode:
-                        print(f"      ⚠️ 连接错误，{wait_time}秒后重试... ({attempt+1}/{max_retries})")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    if self.debug_mode:
-                        print(f"      ⚠️ 连接失败: {str(e)[:50]}")
-                    return None
-                    
-            except requests.exceptions.Timeout as e:
-                if attempt < max_retries - 1:
-                    if self.debug_mode:
-                        print(f"      ⚠️ 请求超时，重试中... ({attempt+1}/{max_retries})")
-                    continue
-                else:
-                    if self.debug_mode:
-                        print(f"      ⚠️ 请求超时: {str(e)[:50]}")
-                    return None
-                    
-            except Exception as e:
-                if self.debug_mode:
-                    print(f"      ⚠️ 请求异常: {str(e)[:50]}")
-                return None
-        
+            except requests.exceptions.RequestException as e:
+                time.sleep((attempt + 1) * 3)
+                continue
         return None
         
     async def _fetch_kline_local(self, stock_code: str):
@@ -838,234 +845,7 @@ class StockDataService:
             
         return min(1.0, quality)
 
-    async def analyze_stock(self, stock_code: str, db: Session):
-        """综合分析评分 - 严格映射每一个字段"""
-        today = datetime.date.today()
-        market = db.query(DailyMarketData).filter(DailyMarketData.code == stock_code).order_by(desc(DailyMarketData.date)).first()
-        if not market: return
-        
-        # 1. 波动率深度分析 (0-40分)
-        v30, v60, vol_score = 0.0, 0.0, 0
-        # 获取120条数据确保足够
-        hist = db.query(HistoricalData).filter(
-            HistoricalData.stock_code == stock_code,
-            HistoricalData.close.isnot(None)
-        ).order_by(desc(HistoricalData.date)).limit(120).all()
-
-        # 反转为正序
-        prices = [float(h.close) for h in reversed(hist)]
-        price_series = pd.Series(prices)
-        log_returns = np.log(price_series / price_series.shift(1)).dropna()
-
-        # 分别计算30日和60日
-        if len(log_returns) >= 30:
-            v30 = float(log_returns.tail(30).std() * np.sqrt(252) * 100)
-            
-        if len(log_returns) >= 60:
-            v60 = float(log_returns.tail(60).std() * np.sqrt(252) * 100)  # ✅ 修复
-        
-        if v30 < 20: vol_score = 40
-        elif v30 < 30: vol_score = 30
-        elif v30 < 40: vol_score = 20
-        else: vol_score = 10
-
-        # 2. 股息率计算 (0-30分)
-        div_yield, div_score = 0.0, 0
-        one_year_ago = today - datetime.timedelta(days=365)
-        dividends = db.query(DividendData).filter(DividendData.stock_code == stock_code, DividendData.ex_dividend_date >= one_year_ago).all()
-        
-        total_cash_div = 0.0
-        if dividends and market.latest_price:
-            for d in dividends:
-                div_str = str(d.dividend)
-                
-                # 格式1: "10派5.2" ✅
-                match = re.search(r'10派(\d+\.?\d*)', div_str)
-                if match:
-                    total_cash_div += float(match.group(1)) / 10
-                    continue
-                
-                # 格式2: "派1.5" ✅
-                match = re.search(r'派(\d+\.?\d*)', div_str)
-                if match:
-                    total_cash_div += float(match.group(1)) / 10
-            
-            if total_cash_div > 0:
-                div_yield = float((total_cash_div / market.latest_price) * 100)
-                print(f"      ✓ 股息率: {div_yield:.2f}% (年度分红: {total_cash_div:.2f}元/股)")
-
-            if div_yield >= 5: div_score = 30
-            elif div_yield >= 3: div_score = 20
-            elif div_yield >= 1.5: div_score = 10
-
-        # 3. 财务与成长性 (0-30分)
-        # ✅ 这里解包元组，修复 TypeError
-        roe, profit_growth = await self.fetch_financial_metrics(stock_code)
-        # 成长性评分
-        growth_score = 0
-        if roe > 15:
-            growth_score = 30
-        elif roe > 12:
-            growth_score = 25
-        elif roe > 10:
-            growth_score = 20
-        elif roe > 8:
-            growth_score = 15
-        elif roe > 5:
-            growth_score = 10
-
-        # 4. 汇总保存 - 映射模型中的所有字段
-        res = StockAnalysisResult(
-            stock_code=stock_code,
-            stock_name=market.name,
-            analysis_date=today,
-            latest_price=market.latest_price,
-            pe_ratio=market.pe_dynamic,
-            pb_ratio=market.pb,
-            roe=round(roe, 2),
-            profit_growth=round(profit_growth, 2),
-            volatility_30d=round(v30, 2),
-            volatility_60d=round(v60, 2),
-            volatility_score=vol_score,
-            dividend_yield=round(div_yield, 2),
-            dividend_score=div_score,
-            growth_score=growth_score,
-            total_score=int(vol_score + div_score + growth_score),
-            suggestion="强烈推荐" if (vol_score + div_score + growth_score) >= 70 else ("推荐" if (vol_score + div_score + growth_score) >= 55 else "观望"),
-            data_source="automated_v3"
-        )
-        db.merge(res)
-        db.commit()
-        return res.total_score
-
-    async def analyze_stock(self, stock_code: str, db: Session):
-        """
-        深度分析单只股票
-        目标：严格对照模型字段，确保 dividend_yield, volatility_60d, roe 等不再为 NULL
-        """
-        today = datetime.date.today()
-        
-        # 1. 基础行情校验 (DailyMarketData)
-        market = db.query(DailyMarketData).filter(
-            DailyMarketData.code == stock_code
-        ).order_by(desc(DailyMarketData.date)).first()
-        
-        if not market or not market.latest_price:
-            print(f"   ⚠️ {stock_code} 缺失实时行情，无法分析")
-            return None
-
-        # ---------------------------------------------------------
-        # 2. 波动率计算 (HistoricalData)
-        # ---------------------------------------------------------
-        v30, v60, vol_score = 0.0, 0.0, 0
-        
-        # 核心修复：查询最近120条，确保有足够数据算60日波动率
-        hist = db.query(HistoricalData).filter(
-            HistoricalData.stock_code == stock_code
-        ).order_by(desc(HistoricalData.date)).limit(100).all()
-
-        if len(hist) >= 20:
-            # 必须反转为正序（从旧到新）计算收益率
-            prices = [h.close for h in reversed(hist)]
-            price_series = pd.Series(prices)
-            log_returns = np.log(price_series / price_series.shift(1)).dropna()
-            
-            # 计算30日波动率
-            if len(log_returns) >= 30:
-                v30 = log_returns.tail(30).std() * np.sqrt(252) * 100
-                
-            # 计算60日波动率
-            if len(log_returns) >= 60:
-                v60 = log_returns.tail(60).std() * np.sqrt(252) * 100
-            
-            # 波动率评分 (按照30日标准)
-            if v30 > 0:
-                if v30 < 20: vol_score = 40
-                elif v30 < 30: vol_score = 30
-                elif v30 < 40: vol_score = 20
-                else: vol_score = 10
-
-        # ---------------------------------------------------------
-        # 3. 股息率计算 (DividendData)
-        # ---------------------------------------------------------
-        div_yield, div_score = 0.0, 0
-        one_year_ago = today - datetime.timedelta(days=365)
-        
-        # 核心修复：查询过去一年内的所有分红记录
-        dividends = db.query(DividendData).filter(
-            DividendData.stock_code == stock_code,
-            DividendData.ex_dividend_date >= one_year_ago
-        ).all()
-        
-        total_cash_div = 0.0
-        if dividends:
-            for d in dividends:
-                # 兼容 "10派5", "10派5.2", "派1.5" 等各种字符串格式
-                match = re.search(r'派(\d+\.?\d*)', str(d.dividend))
-                if match:
-                    # 换算成每股分红额
-                    total_cash_div += float(match.group(1)) / 10
-            
-            # 计算股息率：年度总分红 / 当前股价 * 100
-            div_yield = (total_cash_div / market.latest_price) * 100
-            
-            # 股息率评分
-            if div_yield >= 5: div_score = 30
-            elif div_yield >= 3: div_score = 20
-            elif div_yield >= 1.5: div_score = 10
-
-        # ---------------------------------------------------------
-        # 4. 财务数据获取 (ROE & Growth)
-        # ---------------------------------------------------------
-        roe, profit_growth = await self.fetch_financial_metrics(stock_code)
-        
-        # 成长性评分
-        growth_score = 0
-        if roe > 15: growth_score = 30
-        elif roe > 10: growth_score = 20
-        elif roe > 5: growth_score = 10
-
-        # ---------------------------------------------------------
-        # 5. 结果持久化 (映射到 StockAnalysisResult 模型)
-        # ---------------------------------------------------------
-        analysis_res = StockAnalysisResult(
-            stock_code=stock_code,
-            stock_name=market.name,
-            analysis_date=today,
-            
-            # 基础数据
-            latest_price=market.latest_price,
-            pe_ratio=market.pe_dynamic,
-            pb_ratio=market.pb,
-            
-            # 波动率指标 (显式映射)
-            volatility_30d=round(v30, 2) if v30 > 0 else 0.0,
-            volatility_60d=round(v60, 2) if v60 > 0 else 0.0,
-            
-            # 财务指标 (显式映射)
-            dividend_yield=round(div_yield, 2) if div_yield > 0 else 0.0,  # ✅
-            roe=round(roe, 2) if roe > 0 else 0.0,  # ✅
-            profit_growth=round(profit_growth, 2) if profit_growth else 0.0,  # ✅
-            
-            
-            # 评分详情 (显式映射)
-            volatility_score=int(vol_score),
-            dividend_score=int(div_score),
-            growth_score=int(growth_score),
-            total_score=int(vol_score + div_score + growth_score),
-            
-            suggestion="推荐" if (vol_score + div_score + growth_score) >= 60 else "观望",
-            data_source="automated_v3"
-        )
-
-        try:
-            db.merge(analysis_res)
-            db.commit()
-            return analysis_res.total_score
-        except Exception as e:
-            db.rollback()
-            print(f"   ❌ {stock_code} 结果入库失败: {e}")
-            return None
+    
 
     async def analyze_all_watched_stocks(self):
         """主分析任务循环 - 修复版"""
@@ -1187,6 +967,97 @@ class StockDataService:
         finally:
             db.close()
     
+    async def analyze_stock(self, stock_code: str, db: Session):
+        """深度分析单只股票 (优化版 100 分评分机制)"""
+        today = datetime.date.today()
+        market = db.query(DailyMarketData).filter(DailyMarketData.code == stock_code).order_by(desc(DailyMarketData.date)).first()
+        if not market or not market.latest_price: return None
+
+        # 1. 趋势与波动率 (20分)
+        v30, v60, vol_score = 0.0, 0.0, 0
+        ma60 = 0.0
+        hist = db.query(HistoricalData).filter(HistoricalData.stock_code == stock_code, HistoricalData.close.isnot(None)).order_by(desc(HistoricalData.date)).limit(100).all()
+
+        if len(hist) >= 20:
+            prices = [float(h.close) for h in reversed(hist)]
+            price_series = pd.Series(prices)
+            log_returns = np.log(price_series / price_series.shift(1)).dropna()
+            
+            if len(log_returns) >= 30: v30 = log_returns.tail(30).std() * np.sqrt(252) * 100
+            if len(log_returns) >= 60:
+                v60 = log_returns.tail(60).std() * np.sqrt(252) * 100
+                ma60 = price_series.tail(60).mean() 
+            
+            vol_sub_score = 10 if 0 < v30 < 25 else (7 if v30 < 35 else (4 if v30 < 45 else 0))
+            trend_sub_score = 0
+            if ma60 > 0:
+                latest_p = market.latest_price
+                if latest_p > ma60 * 1.05: trend_sub_score = 10     
+                elif latest_p >= ma60: trend_sub_score = 7          
+                elif latest_p > ma60 * 0.90: trend_sub_score = 3    
+            vol_score = vol_sub_score + trend_sub_score
+
+        # 2. 股息率防守计算 (20分)
+        div_yield, div_score = 0.0, 0
+        one_year_ago = today - datetime.timedelta(days=365)
+        dividends = db.query(DividendData).filter(DividendData.stock_code == stock_code, DividendData.ex_dividend_date >= one_year_ago).all()
+        total_cash_div = 0.0
+        if dividends:
+            for d in dividends:
+                match = re.search(r'派(\d+\.?\d*)', str(d.dividend))
+                if match: total_cash_div += float(match.group(1)) / 10
+            
+            if total_cash_div > 0 and market.latest_price > 0:
+                div_yield = (total_cash_div / market.latest_price) * 100
+            
+            if div_yield >= 4.0: div_score = 20
+            elif div_yield >= 2.5: div_score = 15
+            elif div_yield >= 1.0: div_score = 10
+            elif div_yield > 0: div_score = 5
+
+        # 3. 财务与估值 (60分)
+        roe, profit_growth = await self.fetch_financial_metrics(stock_code)
+        
+        roe_score = 20 if roe >= 20 else (15 if roe >= 15 else (10 if roe >= 10 else (5 if roe >= 5 else 0)))
+        pg_score = 20 if profit_growth >= 30 else (15 if profit_growth >= 15 else (10 if profit_growth > 0 else (5 if profit_growth > -10 else 0)))
+        
+        pe_score = 0
+        pe = market.pe_dynamic
+        if 0 < pe <= 15: pe_score = 20        
+        elif 15 < pe <= 30: pe_score = 15     
+        elif 30 < pe <= 50: pe_score = 10     
+        elif 50 < pe <= 100: pe_score = 5     
+        
+        growth_score = roe_score + pg_score + pe_score
+        total_score = int(vol_score + div_score + growth_score)
+        
+        # 动态评级
+        if total_score >= 80: suggestion = "强烈推荐"
+        elif total_score >= 65: suggestion = "推荐买入"
+        elif total_score >= 50: suggestion = "观望持仓"
+        else: suggestion = "谨慎回避"
+
+        analysis_res = StockAnalysisResult(
+            stock_code=stock_code, stock_name=market.name, analysis_date=today,
+            latest_price=market.latest_price, pe_ratio=market.pe_dynamic, pb_ratio=market.pb,
+            volatility_30d=round(v30, 2) if v30 > 0 else 0.0,
+            volatility_60d=round(v60, 2) if v60 > 0 else 0.0,
+            dividend_yield=round(div_yield, 2) if div_yield > 0 else 0.0,
+            roe=round(roe, 2) if roe > 0 else 0.0,
+            profit_growth=round(profit_growth, 2) if profit_growth else 0.0,
+            volatility_score=int(vol_score), dividend_score=int(div_score), growth_score=int(growth_score),
+            total_score=total_score, suggestion=suggestion, data_source="automated_v4" 
+        )
+
+        try:
+            db.merge(analysis_res)
+            db.commit()
+            return analysis_res.total_score
+        except Exception as e:
+            db.rollback()
+            print(f"   ❌ {stock_code} 结果入库失败: {e}")
+            return None
+
     async def _check_update_needed(self, db: Session, watched_stocks):
         """检查是否需要更新"""
         # 检查最新分析日期
